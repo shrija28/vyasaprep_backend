@@ -22,6 +22,7 @@ Implements task 4.3 / REQ-5.1, REQ-5.3, REQ-5.4, REQ-8.5:
 
 from __future__ import annotations
 import os
+import re
 
 import hashlib
 import logging
@@ -36,7 +37,7 @@ from sqlalchemy.orm import Session
 
 from ..db.models import IndexedFile, Question, Subject
 from ..middleware.rbac import require_admin
-from ..rag.mcq_extractor import extract_or_generate_mcqs
+from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question
 from ..rag.topic_matcher import match_filename_to_topic, is_topic_matching, SUBJECT_CHAPTERS
 
 # Graceful degradation for Python 3.14 compatibility
@@ -147,6 +148,69 @@ def _record_indexed_file(db: Session, subject: str, filename: str, file_hash: st
     return record
 
 
+def _normalise_mcq_answer(ans: Any) -> int:
+    """Convert MCQ answer values like A/B/C/D or numeric indices to a 0..3 index."""
+    if ans is None:
+        return 0
+    if isinstance(ans, str):
+        value = ans.strip().lower()
+        if value in ("a", "b", "c", "d"):
+            return {"a": 0, "b": 1, "c": 2, "d": 3}[value]
+        try:
+            idx = int(value)
+            if 0 <= idx <= 3:
+                return idx
+        except ValueError:
+            pass
+    try:
+        idx = int(ans)
+        if 0 <= idx <= 3:
+            return idx
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
+def _clean_question_options(opts: Any) -> List[str]:
+    """Return a 4-option list stripped of label prefixes and blank entries."""
+    if not isinstance(opts, list):
+        return []
+    cleaned: List[str] = []
+    for opt in opts[:4]:
+        if opt is None:
+            continue
+        value = str(opt).strip()
+        if not value:
+            continue
+        value = value.lstrip("([")
+        value = value.rstrip(")]")
+        value = value.replace("\u00a0", " ")
+        if re.match(r"^[A-Da-d][\.):-]\s*", value):
+            value = re.sub(r"^[A-Da-d][\.):-]\s*", "", value, count=1, flags=re.IGNORECASE)
+        if value:
+            cleaned.append(value.strip())
+    return cleaned[:4]
+
+
+def _prepare_valid_mcq(mcq: dict, subject: str, fallback_topic: Optional[str] = None) -> Optional[dict]:
+    """Validate extracted MCQ metadata against the backend rules before storage."""
+    q_text = str(mcq.get("q", "") or "").strip()
+    opts = _clean_question_options(mcq.get("opts", []))
+    if not q_text or len(opts) != 4:
+        return None
+    if not is_valid_question(q_text, opts, subject=subject):
+        return None
+
+    topic = str(mcq.get("topic") or fallback_topic or subject or "General").strip() or "General"
+    return {
+        "q": q_text,
+        "opts": opts,
+        "ans": _normalise_mcq_answer(mcq.get("ans", 0)),
+        "topic": topic,
+        "exp": str(mcq.get("exp", "") or "").strip(),
+    }
+
+
 def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uuid.UUID, source_type: str = "question_paper")-> int:
     """Store extracted MCQs as platform-wide Question rows (institution_id=NULL).
 
@@ -154,31 +218,23 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
     """
     stored = 0
     for mcq in mcqs:
-        q_text = mcq.get("q", "").strip()
-        opts = mcq.get("opts", [])
-        ans = mcq.get("ans", 0)
-        ans_str = str(ans).strip()
-        if ans_str.lower() in ("a", "b", "c", "d"):
-            ans_str = str({"a": 0, "b": 1, "c": 2, "d": 3}[ans_str.lower()])
-        topic = mcq.get("topic", "General")
-
-        # Validate
-        if not q_text or not isinstance(opts, list) or len(opts) != 4:
+        valid = _prepare_valid_mcq(mcq, subject)
+        if valid is None:
             continue
 
         from ..rag.mcq_extractor import shuffle_question_options
-        shuffled_opts, new_ans = shuffle_question_options(opts, ans_str)
+        shuffled_opts, new_ans = shuffle_question_options(valid["opts"], valid["ans"])
 
         row = Question(
             subject=subject,
-            question_text=q_text,
+            question_text=valid["q"],
             options=shuffled_opts,
             correct_option=str(new_ans),
-            topic=topic if isinstance(topic, str) else "General",
+            topic=valid["topic"],
             generation_batch_id=batch_id,
             institution_id=None,  # platform-wide
             source_type=source_type,
-            explanation=mcq.get("exp", ""),
+            explanation=valid["exp"],
         )
         db.add(row)
         stored += 1
@@ -366,7 +422,7 @@ def clear_indexed_files() -> Any:
         db.delete(q)
 
     try:
-        stores.clear(selected)
+        stores.reset(selected)
     except Exception:
         pass
 
@@ -561,6 +617,79 @@ def upload(subject: Optional[str] = None, file_type: str = "question_paper", fil
     warnings: List[str] = []
     already_indexed: List[dict[str, Any]] = []
     indexed_files = 0
+    total_chunks = 0
+    total_questions_extracted = 0
+    preview_only = str(request.form.get("preview_only") or request.args.get("preview_only") or "").lower() in {"1", "true", "yes", "preview"}
+
+    if preview_only:
+        logger.info("Admin preview mode: validating extracted questions for %s without persisting to DB", selected.value)
+        all_preview_questions: List[dict[str, Any]] = []
+        seen_questions = set()
+        for upload_file in files:
+            filename = upload_file.filename or ""
+            content = upload_file.read()
+            file_hash = _compute_file_hash(content)
+            existing = _check_duplicate(db, selected.value, file_hash)
+            if existing is not None:
+                already_indexed.append({
+                    "filename": filename,
+                    "existing_filename": existing.filename,
+                    "file_hash": file_hash,
+                    "chunk_count": existing.chunk_count,
+                    "indexed_at": existing.indexed_at.isoformat() if existing.indexed_at else None,
+                })
+                logger.info(
+                    "Preview mode will still inspect '%s' even though it matches an existing indexed file hash; no payload is stored.",
+                    filename,
+                )
+
+            text = _extract_text(filename, content)
+            if text is None or not text.strip():
+                warnings.append(filename)
+                continue
+
+            chunks = chunk_text(text)
+            if not chunks:
+                warnings.append(filename)
+                continue
+
+            total_chunks += len(chunks)
+            file_topic = match_filename_to_topic(filename, selected.value)
+            mcqs = extract_or_generate_mcqs(
+                text,
+                topic=file_topic if file_topic != "General" else selected.value,
+                min_questions=5,
+                allowed_topics=[file_topic] if file_topic != "General" else None,
+            )
+            for mcq in mcqs:
+                valid = _prepare_valid_mcq(mcq, selected.value, fallback_topic=file_topic)
+                if valid is None:
+                    continue
+                fingerprint = valid["q"].lower().strip()
+                if fingerprint in seen_questions:
+                    continue
+                seen_questions.add(fingerprint)
+                all_preview_questions.append({
+                    "q": valid["q"],
+                    "opts": valid["opts"],
+                    "ans": valid["ans"],
+                    "topic": valid["topic"],
+                    "exp": valid["exp"],
+                })
+
+        total_questions_extracted = len(all_preview_questions)
+        return {
+            "success": True,
+            "subject": selected.value,
+            "preview_only": True,
+            "indexed_files": len(files),
+            "total_chunks": total_chunks,
+            "questions_extracted": total_questions_extracted,
+            "preview_questions": sorted(all_preview_questions, key=lambda item: item["q"].lower()),
+            "warnings": warnings,
+            "already_indexed": already_indexed,
+        }
+
     # Clear previously indexed files for this subject so only this uploaded batch defines the active scope
     try:
         old_files = db.execute(
@@ -576,7 +705,7 @@ def upload(subject: Optional[str] = None, file_type: str = "question_paper", fil
         logger.warning("Could not clear previous indexed files: %s", e)
 
     try:
-        stores.clear(selected)
+        stores.reset(selected)
     except Exception as exc:
         logger.warning("Failed to reset store for %s: %s", selected.value, exc)
 
