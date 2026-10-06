@@ -44,6 +44,7 @@ from ..rag.topic_matcher import match_filename_to_topic, is_topic_matching, SUBJ
 # pytesseract is not available in Python 3.14 (pkgutil.find_loader removed)
 try:
     from ..rag.parsing import (
+        PDFOCRError,
         chunk_text,
         extract_text_from_docx,
         extract_text_from_pdf,
@@ -59,6 +60,7 @@ except ImportError as e:
     )
     PARSING_AVAILABLE = False
     # Provide stub functions so the module can still be imported
+    PDFOCRError = RuntimeError
     chunk_text = None
     extract_text_from_docx = None
     extract_text_from_pdf = None
@@ -484,7 +486,10 @@ def upload_single(subject: Optional[str] = None, file_type: str = "question_pape
         }
 
     # Extract text
-    text = _extract_text(filename, content)
+    try:
+        text = _extract_text(filename, content)
+    except PDFOCRError as exc:
+        return make_response(jsonify({"error": "ocr_failed", "message": str(exc)}), 502)
     if text is None:
         return {
             "status": "unsupported",
@@ -643,7 +648,12 @@ def upload(subject: Optional[str] = None, file_type: str = "question_paper", fil
                     filename,
                 )
 
-            text = _extract_text(filename, content)
+            try:
+                text = _extract_text(filename, content)
+            except PDFOCRError as exc:
+                logger.warning("Preview OCR failed for '%s': %s", filename, exc)
+                warnings.append(filename)
+                continue
             if text is None or not text.strip():
                 warnings.append(filename)
                 continue
@@ -735,7 +745,12 @@ def upload(subject: Optional[str] = None, file_type: str = "question_paper", fil
             })
             continue
 
-        text = _extract_text(filename, content)
+        try:
+            text = _extract_text(filename, content)
+        except PDFOCRError as exc:
+            logger.warning("OCR failed for '%s': %s", filename, exc)
+            warnings.append(filename)
+            continue
         if text is None:
             logger.warning(
                 "File '%s': unsupported extension or extraction returned None → added to warnings",

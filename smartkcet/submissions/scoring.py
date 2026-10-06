@@ -92,7 +92,16 @@ def _normalised_marks(value: Any)-> int:
 
 
 def _resolve_option_index(val: Any, opts: Any = None) -> tuple[Optional[int], Optional[str]]:
-    """Resolve an option value (index "0".."3", letter "A".."D", or option text) to (index, clean_text)."""
+    """Resolve an option value (index "0".."3", letter "A".."D", or option text) to (index, clean_text).
+
+    Resolution order (critical for correctness):
+      1. Single digit "0"–"3" or single letter "a"–"d" / "A"–"D" → treat as index directly.
+         This MUST come before text matching because correct_option is stored as a digit
+         string ("0", "1", "2", "3") in the DB, and option texts may themselves be digits
+         (e.g. chemistry options "1", "2", "4", "8") which would otherwise cause a false
+         text match at the wrong position.
+      2. Multi-character value → try to match against cleaned option text.
+    """
     if val is None:
         return None, None
     val_str = str(val).strip()
@@ -109,18 +118,22 @@ def _resolve_option_index(val: Any, opts: Any = None) -> tuple[Optional[int], Op
 
     val_lower = val_str.lower()
 
-    # 1. Option text match first in clean_opts
-    if clean_opts:
-        for i, opt in enumerate(clean_opts):
-            if opt.lower() == val_lower:
-                return i, opt.lower()
-
-    # 2. Letter or index map ("a".."d", "0".."3")
+    # 1. Single digit or single letter → resolve as index FIRST.
+    #    Never fall through to text matching for these, because the stored
+    #    correct_option is always a digit "0"–"3" and must not be confused
+    #    with option content that happens to contain the same character.
     letter_to_idx = {"a": 0, "b": 1, "c": 2, "d": 3, "0": 0, "1": 1, "2": 2, "3": 3}
     if val_lower in letter_to_idx:
         idx = letter_to_idx[val_lower]
         text = clean_opts[idx].lower() if clean_opts and 0 <= idx < len(clean_opts) else None
         return idx, text
+
+    # 2. Multi-character value → option text match (used when the student's
+    #    answer is sent as the full option string rather than an index).
+    if clean_opts:
+        for i, opt in enumerate(clean_opts):
+            if opt.lower() == val_lower:
+                return i, opt.lower()
 
     return None, val_lower
 

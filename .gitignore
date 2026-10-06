@@ -24,3 +24,31 @@ data/faiss/*.chunks.json
 data/faiss.zip
 data/textbooks/*
 !data/textbooks/.gitkeep
+
+# ML model caches (fastembed / HuggingFace / ONNX)
+.cache/
+fastembed_cache/
+huggingface_cache/
+~/.cache/huggingface/
+models/
+*.onnx
+*.onnx.data
+*.bin
+tokenizer_config.json
+vocab.txt
+special_tokens_map.json
+
+# Large binary / model files
+*.pt
+*.pth
+*.h5
+*.npz
+*.npy
+*.pkl
+*.safetensors
+
+# Scratch / one-off scripts (not part of deployable app)
+scratch/
+
+# Vercel build output
+.vercel/

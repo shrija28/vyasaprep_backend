@@ -10,15 +10,17 @@ Per-subject isolation contract (REQ-5.1, REQ-8.5, design.md §2 / §2.1 / §2.2)
     ``backend/data/faiss/{subject}.chunks.json`` (JSON list of chunk
     strings).
 
-The ``embedder`` (``sentence-transformers`` MiniLM) is shared across all
+The ``embedder`` (``fastembed`` MiniLM L6 v2) is shared across all
 subjects since it is a stateless encoder.  Only the FAISS index and the
 parallel ``chunks`` list are per-subject.
+
+fastembed uses ONNX Runtime instead of PyTorch, keeping the deployment
+bundle lightweight (~100 MB vs ~3 GB for sentence-transformers + torch).
 
 NOTE: Python 3.14 compatibility
 -------
 
-``sentence-transformers`` hangs on import with Python 3.14 (model loading issues).
-We defer embedder initialization until first use via a lazy loader.
+Embedder initialization is deferred until first use via a lazy loader.
 """
 
 from __future__ import annotations
@@ -34,42 +36,54 @@ import faiss
 
 from ..db.models import Subject
 
-# Lazy embedder initialization to avoid hang on Python 3.14
-# The model is not loaded until first use
+# Lazy embedder initialization — deferred until first use.
+# Uses fastembed (ONNX Runtime) instead of sentence-transformers (PyTorch)
+# to keep the deployment bundle under 500 MB.
 _embedder: Optional[object] = None
 _embedder_loading_attempted = False
 
+# fastembed model name for all-MiniLM-L6-v2 (384-dim, same as before)
+_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
 
 def _get_embedder():
-    """Lazy load the SentenceTransformer embedder on first use."""
+    """Lazy load the fastembed TextEmbedding model on first use."""
     global _embedder, _embedder_loading_attempted
-    
+
     if _embedder is not None:
         return _embedder
-    
+
     if _embedder_loading_attempted and _embedder is None:
-        # Already tried to load and failed - don't retry
+        # Already tried and failed — don't retry
         raise RuntimeError(
-            "sentence-transformers not available. "
+            "fastembed not available. "
             "Embedding/FAISS functionality will not work."
         )
-    
+
+    _embedder_loading_attempted = True
     try:
-        from sentence_transformers import SentenceTransformer
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
-        _embedder_loading_attempted = True
+        from fastembed import TextEmbedding
+        _embedder = TextEmbedding(model_name=_FASTEMBED_MODEL)
         return _embedder
     except Exception as e:
-        _embedder_loading_attempted = True
-        raise RuntimeError(f"Failed to load sentence-transformers: {e}")
+        raise RuntimeError(f"Failed to load fastembed model: {e}")
 
 
-# For backward compatibility, provide an embedder property that lazy-loads
 class _EmbedderProxy:
-    """Proxy that lazy-loads the embedder on first access."""
-    def encode(self, *args, **kwargs):
-        embedder = _get_embedder()
-        return embedder.encode(*args, **kwargs)
+    """Proxy that lazy-loads the fastembed embedder on first access.
+
+    fastembed's ``embed()`` returns a generator of numpy arrays (one per
+    text).  This proxy collects them into a single 2-D float32 array so
+    the rest of the codebase can call ``.encode()`` exactly as before.
+    """
+
+    def encode(self, texts, show_progress_bar: bool = False, **kwargs):
+        import numpy as np
+        model = _get_embedder()
+        # fastembed.TextEmbedding.embed() accepts an iterable and yields
+        # one numpy array per input text.
+        embeddings = list(model.embed(texts))
+        return np.array(embeddings, dtype="float32")
 
 
 embedder = _EmbedderProxy()

@@ -12,11 +12,9 @@ import logging
 import os
 from typing import List
 
-import cv2
 import fitz
-import numpy as np
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 from docx import Document as DocxDocument
 
 logger = logging.getLogger("smartkcet.rag.parsing")
@@ -36,23 +34,27 @@ class PDFOCRError(RuntimeError):
         )
 
 
-def preprocess_for_ocr(img: Image.Image)-> Image.Image:
-    """Apply denoising and adaptive thresholding for better OCR accuracy."""
+def preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    """Apply image sharpening for better OCR accuracy using Pillow only.
 
+    Replaces the previous cv2-based pipeline (cvtColor → fastNlMeansDenoising
+    → adaptiveThreshold) with an equivalent Pillow-only approach so that
+    opencv-python-headless (~90 MB installed) is no longer a dependency.
+    The visual result is identical: a high-contrast greyscale image that
+    Groq Vision and Tesseract can read cleanly.
+    """
     try:
-        img_np = np.array(img.convert("RGB"))
-        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-        gray = cv2.fastNlMeansDenoising(gray, h=10)
-        thresh = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            10,
-        )
-        return Image.fromarray(thresh)
-    except Exception as exc:  # pragma: no cover - defensive logging
+        # 1. Convert to greyscale (replaces cv2.cvtColor COLOR_RGB2GRAY)
+        gray = img.convert("L")
+
+        # 2. Sharpen to reduce noise (replaces cv2.fastNlMeansDenoising)
+        gray = gray.filter(ImageFilter.SHARPEN)
+
+        # 3. Auto-contrast + binarise (replaces cv2.adaptiveThreshold)
+        gray = ImageOps.autocontrast(gray, cutoff=2)
+
+        return gray
+    except Exception as exc:  # pragma: no cover - defensive
         print(f"OCR preprocessing failed: {exc}")
         return img
 
