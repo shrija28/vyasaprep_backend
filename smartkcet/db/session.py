@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Iterator
 
 from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 # Importing config has the side-effect of running ``load_dotenv()`` so any
@@ -28,7 +28,7 @@ from smartkcet import config as _config  # noqa: F401  (import for side-effects)
 # PostgreSQL is the default project database.  If no ``DATABASE_URL`` is
 # provided explicitly, the app uses the local PostgreSQL service configured for
 # this project.
-_DEFAULT_POSTGRES_URL = "postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/smartkcet"
+_DEFAULT_POSTGRES_URL = "postgresql+pg8000://postgres:postgres@127.0.0.1:5432/smartkcet"
 _DEFAULT_SQLITE_PATH = Path(__file__).resolve().parents[2] / "smartkcet.db"
 _DEFAULT_DATABASE_URL = _DEFAULT_POSTGRES_URL
 
@@ -38,7 +38,13 @@ def _resolve_database_url() -> str:
 
     if os.getenv("USE_SQLITE", "").lower() in ("1", "true", "yes"):
         return f"sqlite:///{_DEFAULT_SQLITE_PATH}"
-    return os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)
+    database_url = make_url(os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL))
+    if (
+        database_url.get_backend_name() == "postgresql"
+        and database_url.get_driver_name() == "psycopg2"
+    ):
+        database_url = database_url.set(drivername="postgresql+pg8000")
+    return database_url.render_as_string(hide_password=False)
 
 
 def _build_engine(database_url: str)-> Engine:

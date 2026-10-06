@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from typing import List
 
 import fitz
@@ -17,6 +18,20 @@ from PIL import Image, ImageFilter, ImageOps
 from docx import Document as DocxDocument
 
 logger = logging.getLogger("smartkcet.rag.parsing")
+
+
+class PDFOCRError(RuntimeError):
+    """A safe, user-facing summary of a failed Groq Vision OCR request."""
+
+    def __init__(self, category: str, status_code: int | None = None, pages: int = 1):
+        self.category = category
+        self.status_code = status_code
+        self.pages = pages
+        status = f", HTTP {status_code}" if status_code is not None else ""
+        super().__init__(
+            f"Groq Vision OCR failed on {pages} page(s) ({category}{status}). "
+            "Verify GROQ_API_KEY and GROQ_VISION_MODEL."
+        )
 
 
 def preprocess_for_ocr(img: Image.Image) -> Image.Image:
@@ -46,10 +61,14 @@ def preprocess_for_ocr(img: Image.Image) -> Image.Image:
 
 def _process_groq_vision(img_str: str, page_num: int)-> str:
     from ..rag.groq_client import get_groq_client
+    model = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b").strip()
+    if not model:
+        raise PDFOCRError("MissingVisionModelConfiguration")
+
     try:
         client = get_groq_client()
         completion = client.chat.completions.create(
-            model="llama-3.2-11b-vision-instruct",
+            model=model,
             messages=[
                 {
                     "role": "user",
@@ -63,8 +82,15 @@ def _process_groq_vision(img_str: str, page_num: int)-> str:
         )
         return completion.choices[0].message.content or ""
     except Exception as groq_exc:
-        logger.warning(f"Groq Vision failed on page {page_num+1}: {groq_exc}")
-        return ""
+        status_code = getattr(groq_exc, "status_code", None)
+        logger.warning(
+            "Groq Vision failed on page %d (model=%s, category=%s, status=%s)",
+            page_num + 1,
+            model,
+            type(groq_exc).__name__,
+            status_code,
+        )
+        raise PDFOCRError(type(groq_exc).__name__, status_code) from groq_exc
 
 def extract_text_from_pdf(file_bytes: bytes)-> str:
     """Extract text from a PDF; fall back to OCR for pages with little text."""
@@ -81,8 +107,9 @@ def extract_text_from_pdf(file_bytes: bytes)-> str:
     
     pages_texts = ["" for _ in range(len(doc))]
     futures = []
+    ocr_errors = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         for page_num, page in enumerate(doc):
             text = page.get_text().strip()
             if len(text) > 50:
@@ -123,10 +150,11 @@ def extract_text_from_pdf(file_bytes: bytes)-> str:
                 futures.append((page_num, base_text, future))
                 
             except Exception as exc:
+                ocr_errors.append(exc)
                 logger.warning(
-                    "Page %d: pixmap/OCR pipeline failed: %s",
+                    "Page %d: pixmap/OCR pipeline failed (%s)",
                     page_num + 1,
-                    exc,
+                    type(exc).__name__,
                 )
                 pages_texts[page_num] = base_text
 
@@ -148,10 +176,20 @@ def extract_text_from_pdf(file_bytes: bytes)-> str:
                     )
                     pages_texts[page_num] = base_text
             except Exception as e:
-                logger.error("Page %d OCR Future failed: %s", page_num + 1, e)
+                ocr_errors.append(e)
+                logger.error(
+                    "Page %d OCR Future failed (%s)", page_num + 1, type(e).__name__
+                )
                 pages_texts[page_num] = base_text
 
     total_text = "\n".join(t for t in pages_texts if t.strip())
+    if ocr_errors:
+        first_error = ocr_errors[0]
+        raise PDFOCRError(
+            getattr(first_error, "category", type(first_error).__name__),
+            getattr(first_error, "status_code", None),
+            pages=len(ocr_errors),
+        ) from first_error
     logger.info(
         "PDF extraction complete: %d page(s) yielded text, total %d chars",
         len([t for t in pages_texts if t.strip()]),

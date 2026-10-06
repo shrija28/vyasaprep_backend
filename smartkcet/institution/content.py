@@ -21,6 +21,7 @@ GET    /content/analytics           – institution student analytics
 
 from __future__ import annotations
 import os
+import re
 
 import hashlib
 import logging
@@ -43,12 +44,13 @@ from ..db.models import (
 from ..db.session import get_async_session as get_session
 from ..db.subscription_models import Institution, Subscription, SubscriptionPlan
 from ..middleware.rbac import require_authenticated
-from ..rag.mcq_extractor import extract_or_generate_mcqs
+from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question, shuffle_question_options
 
 # Graceful degradation for Python 3.14 compatibility
 # pytesseract is not available in Python 3.14 (pkgutil.find_loader removed)
 try:
     from ..rag.parsing import (
+        PDFOCRError,
         chunk_text,
         extract_text_from_docx,
         extract_text_from_pdf,
@@ -64,6 +66,7 @@ except ImportError as e:
     )
     PARSING_AVAILABLE = False
     # Provide stub functions so the module can still be imported
+    PDFOCRError = RuntimeError
     chunk_text = None
     extract_text_from_docx = None
     extract_text_from_pdf = None
@@ -280,29 +283,88 @@ def _record_indexed_file(db: Session, subject: str, filename: str, file_hash: st
     return record
 
 
-def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uuid.UUID, institution_id: uuid.UUID)-> int:
-    from ..rag.mcq_extractor import shuffle_question_options
-    stored = 0
-    for mcq in mcqs:
-        q_text = mcq.get("q", "").strip()
-        opts = mcq.get("opts", [])
-        ans = mcq.get("ans", 0)
-        ans_str = str(ans).strip()
-        if ans_str.lower() in ("a", "b", "c", "d"):
-            ans_str = str({"a": 0, "b": 1, "c": 2, "d": 3}[ans_str.lower()])
-        topic = mcq.get("topic", "General")
-        if not q_text or not isinstance(opts, list) or len(opts) != 4:
+def _normalise_mcq_answer(ans: Any) -> int:
+    if ans is None:
+        return 0
+    if isinstance(ans, str):
+        value = ans.strip().lower()
+        if value in ("a", "b", "c", "d"):
+            return {"a": 0, "b": 1, "c": 2, "d": 3}[value]
+        try:
+            idx = int(value)
+            if 0 <= idx <= 3:
+                return idx
+        except ValueError:
+            pass
+    try:
+        idx = int(ans)
+        if 0 <= idx <= 3:
+            return idx
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
+def _clean_question_options(opts: Any) -> List[str]:
+    if not isinstance(opts, list):
+        return []
+    cleaned: List[str] = []
+    for opt in opts[:4]:
+        if opt is None:
             continue
-        shuffled_opts, new_ans = shuffle_question_options(opts, ans_str)
+        value = str(opt).strip()
+        if not value:
+            continue
+        value = value.lstrip("([")
+        value = value.rstrip(")]")
+        value = value.replace("\u00a0", " ")
+        if re.match(r"^[A-Da-d][\.:)-]\s*", value):
+            value = re.sub(r"^[A-Da-d][\.:)-]\s*", "", value, count=1, flags=re.IGNORECASE)
+        if value:
+            cleaned.append(value.strip())
+    return cleaned[:4]
+
+
+def _prepare_valid_mcq(mcq: dict, subject: str, fallback_topic: Optional[str] = None) -> Optional[dict]:
+    q_text = str(mcq.get("q", "") or "").strip()
+    opts = _clean_question_options(mcq.get("opts", []))
+    if not q_text or len(opts) != 4:
+        return None
+    if not is_valid_question(q_text, opts, subject=subject):
+        return None
+
+    topic = str(mcq.get("topic") or fallback_topic or subject or "General").strip() or "General"
+    return {
+        "q": q_text,
+        "opts": opts,
+        "ans": _normalise_mcq_answer(mcq.get("ans", 0)),
+        "topic": topic,
+        "exp": str(mcq.get("exp", "") or "").strip(),
+    }
+
+
+def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uuid.UUID, institution_id: uuid.UUID)-> int:
+    stored = 0
+    seen_questions = set()
+    for mcq in mcqs:
+        valid = _prepare_valid_mcq(mcq, subject, fallback_topic=subject)
+        if valid is None:
+            continue
+        fingerprint = valid["q"].lower().strip()
+        if fingerprint in seen_questions:
+            continue
+        seen_questions.add(fingerprint)
+
+        shuffled_opts, new_ans = shuffle_question_options(valid["opts"], valid["ans"])
         row = Question(
             subject=subject,
-            question_text=q_text,
+            question_text=valid["q"],
             options=shuffled_opts,
             correct_option=str(new_ans),
-            topic=topic if isinstance(topic, str) else "General",
+            topic=valid["topic"],
             generation_batch_id=batch_id,
             institution_id=institution_id,
-            explanation=mcq.get("exp", ""),
+            explanation=valid["exp"],
         )
         db.add(row)
         stored += 1
@@ -310,7 +372,7 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
         try:
             db.commit()
         except Exception as exc:
-            logger.warning("Failed to commit MCQs: %s", exc)
+            logger.warning("Failed to commit institution MCQs: %s", exc)
             db.rollback()
             return 0
     return stored
@@ -423,7 +485,10 @@ def upload_single_file(subject: Optional[str] = None, file_type: str = "question
             "message": f"Already indexed as '{existing.filename}' with {existing.chunk_count} chunks",
         }
 
-    text = _extract_text(filename, content)
+    try:
+        text = _extract_text(filename, content)
+    except PDFOCRError as exc:
+        return make_response(jsonify({"error": "ocr_failed", "message": str(exc)}), 502)
     if text is None:
         return {
             "status": "unsupported",
@@ -557,7 +622,11 @@ def upload_institution_content(subject: Optional[str] = None, file_type: str = "
             })
             continue
 
-        text = _extract_text(filename, content)
+        try:
+            text = _extract_text(filename, content)
+        except PDFOCRError as exc:
+            warnings.append(f"{filename}: {exc}")
+            continue
         if text is None:
             warnings.append(f"{filename}: unsupported file type (only PDF, DOCX, TXT allowed)")
             continue
@@ -585,7 +654,11 @@ def upload_institution_content(subject: Optional[str] = None, file_type: str = "
         )
 
         mcq_batch_id = uuid.uuid4()
-        mcqs = extract_or_generate_mcqs(text, topic=selected.value, min_questions=5)
+        mcqs = extract_or_generate_mcqs(
+            text,
+            topic=selected.value,
+            min_questions=5,
+        )
         questions_extracted = _store_mcqs_in_db(
             db, mcqs, selected.value, mcq_batch_id, inst_id
         )
@@ -851,40 +924,74 @@ def create_institution_exam()-> Any:
     used_qids = {r[0] for r in used_q_rows}
     used_q_fingerprints = {normalize_question_fingerprint(r[1]) for r in used_q_rows if r[1]}
 
-    # Count institution-scoped extracted questions (strictly from user uploads for this institution)
-    query_filters = [
+    # ─────────────────────────────────────────────────────────────────
+    # STEP 1: Collect institution-owned unused questions
+    # ─────────────────────────────────────────────────────────────────
+    inst_query_filters = [
         Question.subject == selected.value,
         Question.institution_id == inst_id,
     ]
     if batch_id:
-        query_filters.append(Question.generation_batch_id == batch_id)
+        inst_query_filters.append(Question.generation_batch_id == batch_id)
 
-    id_rows = session.execute(
-        select(Question.id, Question.question_text).where(*query_filters)
+    inst_id_rows = session.execute(
+        select(Question.id, Question.question_text).where(*inst_query_filters)
     ).all()
 
-    # Exclude any questions that were already assigned to previous exams or duplicated by fingerprint
-    unused_ids = []
+    # Build institution unused pool with deduplication
+    inst_unused_ids = []
     seen_fingerprints = set(used_q_fingerprints)
-    for qid, qtext in id_rows:
+    for qid, qtext in inst_id_rows:
         fp = normalize_question_fingerprint(qtext)
         if qid not in used_qids and fp and fp not in seen_fingerprints:
-            unused_ids.append(qid)
+            inst_unused_ids.append(qid)
             seen_fingerprints.add(fp)
+
+    # ─────────────────────────────────────────────────────────────────
+    # STEP 2: Collect platform-wide unused questions (fallback pool)
+    # NOTE: Do NOT apply batch_id filter to platform questions because
+    # platform and institution have no shared batch IDs.
+    # ─────────────────────────────────────────────────────────────────
+    platform_query_filters = [
+        Question.subject == selected.value,
+        Question.institution_id.is_(None),  # Platform-wide questions
+    ]
+
+    platform_id_rows = session.execute(
+        select(Question.id, Question.question_text).where(*platform_query_filters)
+    ).all()
+
+    # Build platform unused pool, continuing to deduplicate with institution questions
+    platform_unused_ids = []
+    for qid, qtext in platform_id_rows:
+        fp = normalize_question_fingerprint(qtext)
+        if qid not in used_qids and fp and fp not in seen_fingerprints:
+            platform_unused_ids.append(qid)
+            seen_fingerprints.add(fp)
+
+    # ─────────────────────────────────────────────────────────────────
+    # STEP 3: Merge pools with priority: institution first, then platform
+    # ─────────────────────────────────────────────────────────────────
+    merged_unused_ids = inst_unused_ids + platform_unused_ids
 
     num_sets = len(SET_LABELS)
     target_per_set = 60 # Strictly 60 questions per set
     total_needed = target_per_set
 
-    # Requirement 1: GENERATE QUESTIONS FROM QUESTION BANK ONLY (no synthetic on-the-fly topup)
-    if len(unused_ids) < total_needed:
+    # Requirement: GENERATE QUESTIONS FROM QUESTION BANK + PLATFORM FALLBACK
+    # (no synthetic on-the-fly topup)
+    if len(merged_unused_ids) < total_needed:
+        available_count = len(merged_unused_ids)
         return make_response(jsonify({
             "error": "insufficient_questions",
             "subject": selected.value,
-            "count": len(unused_ids),
+            "count": available_count,
             "required": total_needed,
-            "message": f"Not enough unused questions available in Question Bank for {selected.value} ({len(unused_ids)} available, {total_needed} required). Please upload more question papers first."
+            "message": f"Not enough eligible questions available for {selected.value}. {available_count} available, {total_needed} required."
         }), 422)
+
+    # Restrict the candidate pool to 60 before balancing to preserve source priority.
+    unused_ids = merged_unused_ids[:total_needed]
 
     # Load candidate Question objects
     candidate_objects = session.execute(
