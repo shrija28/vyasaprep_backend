@@ -1,0 +1,817 @@
+smartkcet/institution/content.py:3:Mirrors the Admin upload/questions flow but scoped to the institution's
+smartkcet/institution/content.py:4:namespace.  Every question, indexed file, and exam created here is tagged
+smartkcet/institution/content.py:13:GET    /content/questions           – paginated institution question bank
+smartkcet/institution/content.py:14:GET    /content/questions/counts    – per-subject question counts
+smartkcet/institution/content.py:15:DELETE /content/questions/{id}      – delete institution question
+smartkcet/institution/content.py:42:    Exam, ExamSet, ExamSetQuestion, IndexedFile, Question, Subject, Submission, User,
+smartkcet/institution/content.py:47:from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question, shuffle_question_options
+smartkcet/institution/content.py:92:FEATURE_ADMIN_QBANK = "admin_question_bank"
+smartkcet/institution/content.py:98:def _get_active_plan(db: Session, institution_id: uuid.UUID)-> Optional[SubscriptionPlan]:
+smartkcet/institution/content.py:103:            Subscription.institution_id == institution_id,
+smartkcet/institution/content.py:128:def _require_feature(db: Session, institution_id: uuid.UUID, feature: str, feature_label: str = "This feature")-> None:
+smartkcet/institution/content.py:130:    plan = _get_active_plan(db, institution_id)
+smartkcet/institution/content.py:147:QUESTIONS_PER_SET = 60
+smartkcet/institution/content.py:148:QUESTIONS_PER_EXAM = QUESTIONS_PER_SET * len(SET_LABELS)  # 240
+smartkcet/institution/content.py:172:        if user_row and user_row.institution_id:
+smartkcet/institution/content.py:173:            payload["institution_id"] = str(user_row.institution_id)
+smartkcet/institution/content.py:175:    # Only platform admins can override institution_id via query/header
+smartkcet/institution/content.py:177:        req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+smartkcet/institution/content.py:185:                    payload["institution_id"] = str(inst.id)
+smartkcet/institution/content.py:187:                    payload["institution_id"] = raw
+smartkcet/institution/content.py:189:                payload["institution_id"] = raw
+smartkcet/institution/content.py:191:    if not payload.get("institution_id") or payload.get("institution_id") == "None":
+smartkcet/institution/content.py:203:def _institution_id(payload: dict)-> uuid.UUID:
+smartkcet/institution/content.py:204:    raw = payload.get("institution_id") if payload else None
+smartkcet/institution/content.py:212:    req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+smartkcet/institution/content.py:221:def check_subscription_active(db: Session, institution_id: uuid.UUID)-> bool:
+smartkcet/institution/content.py:260:def _check_duplicate(db: Session, subject: str, file_hash: str, institution_id: uuid.UUID)-> Optional[IndexedFile]:
+smartkcet/institution/content.py:265:        IndexedFile.institution_id == institution_id,
+smartkcet/institution/content.py:270:def _record_indexed_file(db: Session, subject: str, filename: str, file_hash: str, file_size: int, chunk_count: int, institution_id: uuid.UUID, file_type: str = "question_paper")-> IndexedFile:
+smartkcet/institution/content.py:278:        institution_id=institution_id,
+smartkcet/institution/content.py:308:def _clean_question_options(opts: Any) -> List[str]:
+smartkcet/institution/content.py:330:    opts = _clean_question_options(mcq.get("opts", []))
+smartkcet/institution/content.py:333:    if not is_valid_question(q_text, opts, subject=subject):
+smartkcet/institution/content.py:346:def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uuid.UUID, institution_id: uuid.UUID)-> int:
+smartkcet/institution/content.py:348:    seen_questions = set()
+smartkcet/institution/content.py:354:        if fingerprint in seen_questions:
+smartkcet/institution/content.py:356:        seen_questions.add(fingerprint)
+smartkcet/institution/content.py:358:        shuffled_opts, new_ans = shuffle_question_options(valid["opts"], valid["ans"])
+smartkcet/institution/content.py:359:        row = Question(
+smartkcet/institution/content.py:361:            question_text=valid["q"],
+smartkcet/institution/content.py:366:            institution_id=institution_id,
+smartkcet/institution/content.py:381:def _serialise_question(row: Question)-> dict[str, Any]:
+smartkcet/institution/content.py:398:        "question": row.question_text,
+smartkcet/institution/content.py:399:        "question_text": row.question_text,
+smartkcet/institution/content.py:400:        "q": row.question_text,
+smartkcet/institution/content.py:416:def _counts_by_subject(session: Session, institution_id: uuid.UUID)-> dict[str, int]:
+smartkcet/institution/content.py:418:        select(Question.subject, func.count(Question.id))
+smartkcet/institution/content.py:419:        .where(Question.institution_id == institution_id)
+smartkcet/institution/content.py:420:        .group_by(Question.subject)
+smartkcet/institution/content.py:431:def upload_single_file(subject: Optional[str] = None, file_type: str = "question_paper", file: Any = None)-> Any:    
+smartkcet/institution/content.py:437:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:441:    if file_type is None or file_type == "question_paper":
+smartkcet/institution/content.py:442:        file_type = request.form.get("file_type") or request.args.get("file_type") or "question_paper"
+smartkcet/institution/content.py:528:        institution_id=inst_id,
+smartkcet/institution/content.py:533:    mcqs = extract_or_generate_mcqs(text, topic=selected.value, min_questions=5)
+smartkcet/institution/content.py:534:    questions_extracted = _store_mcqs_in_db(
+smartkcet/institution/content.py:539:        inst_id, filename, len(chunks), questions_extracted, selected.value,
+smartkcet/institution/content.py:548:        "questions_extracted": questions_extracted,
+smartkcet/institution/content.py:549:        "message": f"Successfully indexed {len(chunks)} chunks, extracted {questions_extracted} questions",
+smartkcet/institution/content.py:558:def upload_institution_content(subject: Optional[str] = None, file_type: str = "question_paper", files: Optional[List[Any]] = None)-> Any:    
+smartkcet/institution/content.py:563:    """Batch upload question papers to the institution's question bank."""
+smartkcet/institution/content.py:564:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:568:    if file_type is None or file_type == "question_paper":
+smartkcet/institution/content.py:569:        file_type = request.form.get("file_type") or request.args.get("file_type") or "question_paper"
+smartkcet/institution/content.py:602:    total_questions_extracted = 0
+smartkcet/institution/content.py:652:            institution_id=inst_id,
+smartkcet/institution/content.py:660:            min_questions=5,
+smartkcet/institution/content.py:662:        questions_extracted = _store_mcqs_in_db(
+smartkcet/institution/content.py:667:            inst_id, filename, len(chunks), questions_extracted, selected.value,
+smartkcet/institution/content.py:672:        total_questions_extracted += questions_extracted
+smartkcet/institution/content.py:676:        "institution_id": str(inst_id),
+smartkcet/institution/content.py:680:        "questions_extracted": total_questions_extracted,
+smartkcet/institution/content.py:699:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:711:    conditions = [IndexedFile.institution_id == inst_id]
+smartkcet/institution/content.py:723:        "institution_id": str(inst_id),
+smartkcet/institution/content.py:740:# GET /content/questions/counts  (institution question bank counts)
+smartkcet/institution/content.py:743:@router.route("/content/questions/counts", methods=["GET"])
+smartkcet/institution/content.py:744:def get_question_counts()-> Any:    
+smartkcet/institution/content.py:749:    """Return per-subject question counts for this institution's bank."""
+smartkcet/institution/content.py:750:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:752:    insufficient = {s: c < QUESTIONS_PER_EXAM for s, c in counts.items()}
+smartkcet/institution/content.py:754:        "institution_id": str(inst_id),
+smartkcet/institution/content.py:757:        "threshold": QUESTIONS_PER_EXAM,
+smartkcet/institution/content.py:762:# GET /content/questions  (paginated institution question bank)
+smartkcet/institution/content.py:765:@router.route("/content/questions", methods=["GET"])
+smartkcet/institution/content.py:766:def list_institution_questions()-> Any:    
+smartkcet/institution/content.py:772:    """Paginated list of questions in this institution's bank."""
+smartkcet/institution/content.py:773:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:776:    base_filter = [Question.institution_id == inst_id]
+smartkcet/institution/content.py:780:            base_filter.append(Question.generation_batch_id == b_uuid)
+smartkcet/institution/content.py:792:        base_filter.append(Question.subject == selected.value)
+smartkcet/institution/content.py:795:        select(func.count(Question.id)).where(*base_filter)
+smartkcet/institution/content.py:799:        select(Question)
+smartkcet/institution/content.py:801:        .order_by(Question.created_at.desc(), Question.id.asc())
+smartkcet/institution/content.py:807:        "institution_id": str(inst_id),
+smartkcet/institution/content.py:808:        "questions": [_serialise_question(r) for r in rows],
+smartkcet/institution/content.py:818:# DELETE /content/questions/{question_id}
+smartkcet/institution/content.py:821:@router.route("/content/questions/<question_id>", methods=["DELETE"])
+smartkcet/institution/content.py:822:def delete_institution_question(question_id: uuid.UUID)-> Any:    
+smartkcet/institution/content.py:827:    """Delete a question from this institution's bank."""
+smartkcet/institution/content.py:828:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:829:    qid_str = str(question_id)
+smartkcet/institution/content.py:833:            delete(Question).where(
+smartkcet/institution/content.py:834:                Question.id == question_id,
+smartkcet/institution/content.py:835:                Question.institution_id == inst_id,
+smartkcet/institution/content.py:845:        logger.warning("DELETE /content/questions/%s failed: %s", qid_str, exc)
+smartkcet/institution/content.py:861:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:881:    question_count = 60 # Strictly 60 questions per set per user requirement
+smartkcet/institution/content.py:914:    # STRICT NO-REPEAT RULE: Query questions ALREADY used in previous exams for this subject & institution
+smartkcet/institution/content.py:915:    from ..rag.mcq_extractor import normalize_question_fingerprint, apply_subject_subtype_breakdown, apply_kcet_chapter_distribution, interleave_by_subtype, infer_question_subtype, shuffle_question_options
+smartkcet/institution/content.py:918:        select(Question.id, Question.question_text)
+smartkcet/institution/content.py:919:        .join(ExamSetQuestion, Question.id == ExamSetQuestion.question_id)
+smartkcet/institution/content.py:920:        .join(ExamSet, ExamSetQuestion.exam_set_id == ExamSet.id)
+smartkcet/institution/content.py:922:        .where(Exam.subject == selected.value, Exam.institution_id == inst_id)
+smartkcet/institution/content.py:925:    used_q_fingerprints = {normalize_question_fingerprint(r[1]) for r in used_q_rows if r[1]}
+smartkcet/institution/content.py:928:    # STEP 1: Collect institution-owned unused questions
+smartkcet/institution/content.py:931:        Question.subject == selected.value,
+smartkcet/institution/content.py:932:        Question.institution_id == inst_id,
+smartkcet/institution/content.py:935:        inst_query_filters.append(Question.generation_batch_id == batch_id)
+smartkcet/institution/content.py:938:        select(Question.id, Question.question_text).where(*inst_query_filters)
+smartkcet/institution/content.py:945:        fp = normalize_question_fingerprint(qtext)
+smartkcet/institution/content.py:951:    # STEP 2: Collect platform-wide unused questions (fallback pool)
+smartkcet/institution/content.py:952:    # NOTE: Do NOT apply batch_id filter to platform questions because
+smartkcet/institution/content.py:956:        Question.subject == selected.value,
+smartkcet/institution/content.py:957:        Question.institution_id.is_(None),  # Platform-wide questions
+smartkcet/institution/content.py:961:        select(Question.id, Question.question_text).where(*platform_query_filters)
+smartkcet/institution/content.py:964:    # Build platform unused pool, continuing to deduplicate with institution questions
+smartkcet/institution/content.py:967:        fp = normalize_question_fingerprint(qtext)
+smartkcet/institution/content.py:978:    target_per_set = 60 # Strictly 60 questions per set
+smartkcet/institution/content.py:981:    # Requirement: GENERATE QUESTIONS FROM QUESTION BANK + PLATFORM FALLBACK
+smartkcet/institution/content.py:986:            "error": "insufficient_questions",
+smartkcet/institution/content.py:990:            "message": f"Not enough eligible questions available for {selected.value}. {available_count} available, {total_needed} required."
+smartkcet/institution/content.py:996:    # Load candidate Question objects
+smartkcet/institution/content.py:998:        select(Question).where(Question.id.in_(unused_ids))
+smartkcet/institution/content.py:1005:            "q": q.question_text,
+smartkcet/institution/content.py:1007:            "subtype": infer_question_subtype(q.question_text, q.options or [], selected.value),
+smartkcet/institution/content.py:1018:    # Interleave by subtype so adjacent questions alternate in structure
+smartkcet/institution/content.py:1022:    # Standard KCET Model: All sets (Set A, B, C, D) contain the EXACT SAME pool of questions,
+smartkcet/institution/content.py:1023:    # but shuffled into different order sequences across sets so same question number contains different questions.
+smartkcet/institution/content.py:1036:        institution_id=inst_id,
+smartkcet/institution/content.py:1054:                ExamSetQuestion(exam_set_id=exam_set.id, question_id=qid, order_index=i)
+smartkcet/institution/content.py:1060:                "question_count": len(qids),
+smartkcet/institution/content.py:1072:        "institution_id": str(inst_id),
+smartkcet/institution/content.py:1096:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:1101:        .where(Exam.institution_id == inst_id)
+smartkcet/institution/content.py:1143:        "institution_id": str(inst_id),
+smartkcet/institution/content.py:1160:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:1169:    if exam is None or exam.institution_id != inst_id:
+smartkcet/institution/content.py:1199:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:1207:    if exam is None or exam.institution_id != inst_id:
+smartkcet/institution/content.py:1221:# GET /content/exams/{exam_id}/questions  (view questions put in specific exam)
+smartkcet/institution/content.py:1224:@router.route("/content/exams/<exam_id>/questions", methods=["GET"])
+smartkcet/institution/content.py:1225:def get_institution_exam_questions(exam_id: str) -> Any:
+smartkcet/institution/content.py:1229:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:1237:    if exam is None or (exam.institution_id and exam.institution_id != inst_id):
+smartkcet/institution/content.py:1244:    # Auto-heal / synchronize: Ensure Sets B, C, D contain the EXACT SAME pool of questions in shuffled order sequence
+smartkcet/institution/content.py:1248:            select(ExamSetQuestion.question_id)
+smartkcet/institution/content.py:1249:            .where(ExamSetQuestion.exam_set_id == set_a.id)
+smartkcet/institution/content.py:1250:            .order_by(ExamSetQuestion.order_index.asc())
+smartkcet/institution/content.py:1260:                    select(ExamSetQuestion.question_id)
+smartkcet/institution/content.py:1261:                    .where(ExamSetQuestion.exam_set_id == es.id)
+smartkcet/institution/content.py:1262:                    .order_by(ExamSetQuestion.order_index.asc())
+smartkcet/institution/content.py:1267:                        delete(ExamSetQuestion).where(ExamSetQuestion.exam_set_id == es.id)
+smartkcet/institution/content.py:1274:                        ExamSetQuestion(exam_set_id=es.id, question_id=qid, order_index=idx)
+smartkcet/institution/content.py:1285:            select(Question, ExamSetQuestion.order_index)
+smartkcet/institution/content.py:1286:            .join(ExamSetQuestion, Question.id == ExamSetQuestion.question_id)
+smartkcet/institution/content.py:1287:            .where(ExamSetQuestion.exam_set_id == es.id)
+smartkcet/institution/content.py:1288:            .order_by(ExamSetQuestion.order_index.asc())
+smartkcet/institution/content.py:1291:        questions = []
+smartkcet/institution/content.py:1294:            questions.append({
+smartkcet/institution/content.py:1297:                "question_text": q.question_text,
+smartkcet/institution/content.py:1307:            "question_count": len(questions),
+smartkcet/institution/content.py:1308:            "questions": questions
+smartkcet/institution/content.py:1331:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:1343:    students_query = db.query(User).filter(User.institution_id == inst_id, User.role == "student")
+smartkcet/institution/content.py:1349:    all_batches = db.query(InstitutionBatch).filter(InstitutionBatch.institution_id == inst_id).order_by(InstitutionBatch.name.asc()).all()
+smartkcet/institution/content.py:1354:            "institution_id": str(inst_id),
+smartkcet/institution/content.py:1368:            Exam.institution_id == inst_id,
+smartkcet/institution/content.py:1400:        "institution_id": str(inst_id),
+smartkcet/institution/content.py:1413:# GET /content/admin-questions — access admin KCET question bank (Premium gate)
+smartkcet/institution/content.py:1416:@router.route("/content/admin-questions", methods=["GET"])
+smartkcet/institution/content.py:1417:def get_admin_questions_for_institution()-> Any:    
+smartkcet/institution/content.py:1435:    """Return platform-wide (admin) KCET questions for use in institution exams.
+smartkcet/institution/content.py:1437:    This endpoint is gated by the 'admin_question_bank' feature flag.
+smartkcet/institution/content.py:1438:    Only Premium-tier institutions can access the admin KCET question bank.
+smartkcet/institution/content.py:1439:    Basic-tier institutions can only use their own uploaded questions.
+smartkcet/institution/content.py:1441:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:1443:    # Feature gate — requires admin_question_bank flag in plan
+smartkcet/institution/content.py:1447:        "Access to the admin KCET question bank",
+smartkcet/institution/content.py:1450:    base_filter = [Question.institution_id.is_(None)]  # platform-wide questions only
+smartkcet/institution/content.py:1457:        base_filter.append(Question.subject == selected.value)
+smartkcet/institution/content.py:1460:        select(func.count(Question.id)).where(*base_filter)
+smartkcet/institution/content.py:1464:        select(Question)
+smartkcet/institution/content.py:1466:        .order_by(Question.created_at.desc(), Question.id.asc())
+smartkcet/institution/content.py:1472:        "institution_id": str(inst_id),
+smartkcet/institution/content.py:1474:        "questions": [_serialise_question(r) for r in rows],
+smartkcet/institution/content.py:1493:    Frontend uses this to show/hide UI elements (e.g., Admin Question Bank tab).
+smartkcet/institution/content.py:1495:    inst_id = _institution_id(payload)
+smartkcet/institution/content.py:1507:        "institution_id": str(inst_id),
+smartkcet/institution/models.py:75:    # No additional fields needed - institution_id comes from auth context
+smartkcet/institution/models.py:131:    institution_id: UUID = Field(
+smartkcet/institution/models.py:152:    institution_id: UUID
+smartkcet/institution/models.py:180:    institution_id: UUID
+smartkcet/institution/routes.py:11:- Content management (upload, question bank, exams, analytics)
+smartkcet/institution/routes.py:23:from ..db.models import Exam, ExamSet, IndexedFile, Question, Submission, User
+smartkcet/institution/routes.py:72:        if admin_user and admin_user.institution_id:
+smartkcet/institution/routes.py:73:            payload["institution_id"] = str(admin_user.institution_id)
+smartkcet/institution/routes.py:75:    # Only platform admins can override institution_id via query/header
+smartkcet/institution/routes.py:77:        req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
+smartkcet/institution/routes.py:85:                    payload["institution_id"] = str(inst.id)
+smartkcet/institution/routes.py:87:                    payload["institution_id"] = raw
+smartkcet/institution/routes.py:89:                payload["institution_id"] = raw
+smartkcet/institution/routes.py:91:    if not payload.get("institution_id") or payload.get("institution_id") == "None":
+smartkcet/institution/routes.py:149:            "institution_id": str(result.institution_id),
+smartkcet/institution/routes.py:194:    institution_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:206:        result = service.generate_invitation(institution_id, batch_id=batch_id)
+smartkcet/institution/routes.py:210:            "institution_id": str(result.institution_id),
+smartkcet/institution/routes.py:297:        inst_id_str = str(user.institution_id) if user.institution_id else None
+smartkcet/institution/routes.py:306:            institution_id=inst_id_str,
+smartkcet/institution/routes.py:312:            "institution_id": inst_id_str,
+smartkcet/institution/routes.py:390:    institution_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:393:        service.remove_student(institution_id, student_id)
+smartkcet/institution/routes.py:454:        institution_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:457:            User.institution_id == institution_id,
+smartkcet/institution/routes.py:496:            "institution_id": str(institution_id),
+smartkcet/institution/routes.py:523:    inst_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:530:    student = db.query(User).filter(User.id == s_uuid, User.institution_id == inst_id).first()
+smartkcet/institution/routes.py:605:    institution_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:608:        subscription = service.activate_institution_plan(institution_id, data.plan_id)
+smartkcet/institution/routes.py:740:        institution_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:743:        institution = db.query(Institution).filter(Institution.id == institution_id).first()
+smartkcet/institution/routes.py:753:            User.institution_id == institution_id,
+smartkcet/institution/routes.py:763:                Subscription.institution_id == institution_id,
+smartkcet/institution/routes.py:795:            Exam.institution_id == institution_id,
+smartkcet/institution/routes.py:800:            Exam.institution_id == institution_id,
+smartkcet/institution/routes.py:855:        total_questions = db.query(Question).filter(
+smartkcet/institution/routes.py:856:            Question.institution_id == institution_id
+smartkcet/institution/routes.py:861:            db.query(Question.subject, func.count(Question.id))
+smartkcet/institution/routes.py:862:            .filter(Question.institution_id == institution_id)
+smartkcet/institution/routes.py:863:            .group_by(Question.subject)
+smartkcet/institution/routes.py:866:        questions_by_subject = {row[0]: int(row[1]) for row in q_by_sub_rows}
+smartkcet/institution/routes.py:869:            Exam.institution_id == institution_id
+smartkcet/institution/routes.py:873:            IndexedFile.institution_id == institution_id
+smartkcet/institution/routes.py:915:            "institution_id": str(institution_id),
+smartkcet/institution/routes.py:926:            "total_questions": total_questions,
+smartkcet/institution/routes.py:927:            "questions_by_subject": questions_by_subject,
+smartkcet/institution/routes.py:969:    institution_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:971:    institution = db.query(Institution).filter(Institution.id == institution_id).first()
+smartkcet/institution/routes.py:978:            Subscription.institution_id == institution_id,
+smartkcet/institution/routes.py:986:        User.institution_id == institution_id,
+smartkcet/institution/routes.py:994:            "institution_id": str(institution_id),
+smartkcet/institution/routes.py:1011:        "institution_id": str(institution_id),
+smartkcet/institution/routes.py:1035:    institution_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:1040:            .filter(Invitation.institution_id == institution_id)
+smartkcet/institution/routes.py:1085:    institution = db.query(Institution).filter(Institution.id == inv.institution_id).first()
+smartkcet/institution/routes.py:1132:        inst_id_str = str(user.institution_id) if user.institution_id else None
+smartkcet/institution/routes.py:1139:            inst = db.query(Institution).filter(Institution.id == inv.institution_id).first()
+smartkcet/institution/routes.py:1150:            institution_id=inst_id_str,
+smartkcet/institution/routes.py:1157:            "institution_id": inst_id_str,
+smartkcet/institution/routes.py:1187:        institution_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:1198:            Invitation.institution_id == institution_id,
+smartkcet/institution/routes.py:1202:            logger.warning(f"Invitation not found: code={decoded_code}, institution_id={institution_id}")
+smartkcet/institution/routes.py:1260:    if user.institution_id:
+smartkcet/institution/routes.py:1261:        institution = db.query(Institution).filter(Institution.id == user.institution_id).first()
+smartkcet/institution/routes.py:1271:                Subscription.institution_id == institution.id,
+smartkcet/institution/routes.py:1288:        "institution_id": str(user.institution_id) if user.institution_id else None,
+smartkcet/institution/routes.py:1305:    Platform-wide exams (institution_id IS NULL) are NOT shown.
+smartkcet/institution/routes.py:1320:    institution_id = None
+smartkcet/institution/routes.py:1321:    if user and user.institution_id:
+smartkcet/institution/routes.py:1322:        institution_id = user.institution_id
+smartkcet/institution/routes.py:1323:    elif payload.get("institution_id"):
+smartkcet/institution/routes.py:1325:            institution_id = UUID(payload.get("institution_id"))
+smartkcet/institution/routes.py:1327:            institution_id = None
+smartkcet/institution/routes.py:1329:    if not institution_id:
+smartkcet/institution/routes.py:1337:        Exam.institution_id == institution_id,
+smartkcet/institution/routes.py:1400:    institution_id_str = payload.get("institution_id")
+smartkcet/institution/routes.py:1401:    if not institution_id_str:
+smartkcet/institution/routes.py:1404:    institution_id = UUID(institution_id_str)
+smartkcet/institution/routes.py:1408:    students = db.query(User).filter(User.institution_id == institution_id, User.role == "student").all()
+smartkcet/institution/routes.py:1501:    if user.institution_id:
+smartkcet/institution/routes.py:1503:        institution = db.query(Institution).filter(Institution.id == user.institution_id).first()
+smartkcet/institution/routes.py:1507:            User.institution_id == user.institution_id,
+smartkcet/institution/routes.py:1540:            "institution_id": str(user.institution_id) if user.institution_id else None,
+smartkcet/institution/routes.py:1594:        institution_id_raw = payload.get("institution_id")
+smartkcet/institution/routes.py:1595:        if not institution_id_raw:
+smartkcet/institution/routes.py:1598:                detail={"error": "no_institution_id", "message": "No institution ID in session context"}
+smartkcet/institution/routes.py:1600:        institution_id = UUID(str(institution_id_raw))
+smartkcet/institution/routes.py:1605:            .filter(Institution.id == institution_id)
+smartkcet/institution/routes.py:1620:                Subscription.institution_id == institution_id,
+smartkcet/institution/routes.py:1631:        students_summary_list = service.get_institution_students(institution_id)
+smartkcet/institution/routes.py:1637:                User.institution_id == institution_id,
+smartkcet/institution/routes.py:1649:            st_user = db.query(User).filter(User.id == s.user_id, User.institution_id == institution_id).first()
+smartkcet/institution/routes.py:1677:            "institution_id": str(institution_id),
+smartkcet/institution/routes.py:1712:    inst_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:1717:        .filter(InstitutionBatch.institution_id == inst_id)
+smartkcet/institution/routes.py:1742:    inst_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:1753:        institution_id=inst_id,
+smartkcet/institution/routes.py:1776:    inst_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:1784:    batch = db.query(InstitutionBatch).filter(InstitutionBatch.id == b_uuid, InstitutionBatch.institution_id == inst_id).first()
+smartkcet/institution/routes.py:1802:    inst_id = UUID(payload["institution_id"])
+smartkcet/institution/routes.py:1810:    student = db.query(User).filter(User.id == s_uuid, User.institution_id == inst_id, User.role == "student").first()
+smartkcet/institution/routes.py:1819:            batch = db.query(InstitutionBatch).filter(InstitutionBatch.id == b_uuid, InstitutionBatch.institution_id == inst_id).first()
+smartkcet/institution/routes.py:1840:@router.route("/questions", methods=["GET"])
+smartkcet/institution/routes.py:1841:def get_institution_questions_alias():
+smartkcet/institution/routes.py:1842:    from .content import list_institution_questions
+smartkcet/institution/routes.py:1843:    return list_institution_questions()
+smartkcet/institution/service.py:232:                institution_id=institution.id,
+smartkcet/institution/service.py:248:                institution_id=institution.id,
+smartkcet/institution/service.py:278:    def generate_invitation(self, institution_id: UUID, batch_id: Optional[UUID] = None)-> InvitationCodeResponse:
+smartkcet/institution/service.py:285:                    Invitation.institution_id == institution_id,
+smartkcet/institution/service.py:293:                    f"Maximum pending invitations (50) reached for institution {institution_id}"
+smartkcet/institution/service.py:299:                .filter(Invitation.institution_id == institution_id)
+smartkcet/institution/service.py:312:                institution_id=institution_id,
+smartkcet/institution/service.py:330:                institution_id=invitation.institution_id,
+smartkcet/institution/service.py:394:                        institution_id=inst_match.id,
+smartkcet/institution/service.py:429:            if student.institution_id is not None:
+smartkcet/institution/service.py:430:                if student.institution_id != invitation.institution_id:
+smartkcet/institution/service.py:434:                        .filter(Institution.id == student.institution_id)
+smartkcet/institution/service.py:457:                .filter(Institution.id == invitation.institution_id)
+smartkcet/institution/service.py:463:                    f"Institution {invitation.institution_id} not found"
+smartkcet/institution/service.py:473:                    Subscription.institution_id == invitation.institution_id,
+smartkcet/institution/service.py:488:                    User.institution_id == invitation.institution_id,
+smartkcet/institution/service.py:508:            student.institution_id = invitation.institution_id
+smartkcet/institution/service.py:534:    def remove_student(self, institution_id: UUID, student_id: UUID)-> None:
+smartkcet/institution/service.py:543:            institution_id: Institution ID
+smartkcet/institution/service.py:557:            if student.institution_id != institution_id:
+smartkcet/institution/service.py:558:                if student.institution_id is None:
+smartkcet/institution/service.py:564:                        f"Student {student_id} is not linked to institution {institution_id}"
+smartkcet/institution/service.py:574:            student.institution_id = None
+smartkcet/institution/service.py:597:    def get_institution_students(self, institution_id: UUID)-> list[StudentSummary]:
+smartkcet/institution/service.py:601:        accounts that happen to have the same institution_id.
+smartkcet/institution/service.py:604:            institution_id: Institution ID
+smartkcet/institution/service.py:614:                    User.institution_id == institution_id,
+smartkcet/institution/service.py:645:    def activate_institution_plan(self, institution_id: UUID, plan_id: UUID)-> "Subscription":
+smartkcet/institution/service.py:655:            institution_id: Institution ID
+smartkcet/institution/service.py:687:                    Subscription.institution_id == institution_id,
+smartkcet/institution/service.py:712:                institution_id=institution_id,
+smartkcet/institution/service.py:732:                    "institution_id": str(institution_id),
+smartkcet/institution/service.py:745:                .filter(Institution.id == institution_id)
+smartkcet/institution/service.py:846:    def deactivate_institution_students(self, institution_id: UUID)-> int:
+smartkcet/institution/service.py:855:            institution_id: Institution ID
+smartkcet/institution/service.py:867:                .filter(User.institution_id == institution_id)
+smartkcet/institution/service.py:877:                student.institution_id = None
+smartkcet/institution/service.py:883:                .filter(Institution.id == institution_id)
+smartkcet/admin/analytics.py:327:    admin_institution_id = _admin.get(
+smartkcet/admin/analytics.py:328:        "institution_id"
+smartkcet/admin/analytics.py:333:        and admin_institution_id is not None
+smartkcet/admin/analytics.py:336:            User.institution_id
+smartkcet/admin/analytics.py:337:            == admin_institution_id
+smartkcet/admin/dashboard.py:7:  - Platform overview (institutions, students, questions, exams)
+smartkcet/admin/dashboard.py:8:  - Question bank breakdown (admin vs institution, per subject)
+smartkcet/admin/dashboard.py:27:from ..db.models import Exam, ExamSet, IndexedFile, Question, Submission, User
+smartkcet/admin/dashboard.py:65:            func.count(User.institution_id)
+smartkcet/admin/dashboard.py:72:    # ── 3. Questions Aggregation ──────────────────────────────────────────────
+smartkcet/admin/dashboard.py:75:            func.count(case((Question.institution_id.is_(None), 1))),
+smartkcet/admin/dashboard.py:76:            func.count(Question.institution_id)
+smartkcet/admin/dashboard.py:79:    admin_questions_total = q_agg[0] or 0
+smartkcet/admin/dashboard.py:80:    institution_questions_total = q_agg[1] or 0
+smartkcet/admin/dashboard.py:84:            select(Question.subject, func.count(Question.id))
+smartkcet/admin/dashboard.py:85:            .where(Question.institution_id.is_(None))
+smartkcet/admin/dashboard.py:86:            .group_by(Question.subject)
+smartkcet/admin/dashboard.py:91:        select(Institution.name, func.count(Question.id))
+smartkcet/admin/dashboard.py:92:        .join(Question, Question.institution_id == Institution.id)
+smartkcet/admin/dashboard.py:94:        .order_by(func.count(Question.id).desc())
+smartkcet/admin/dashboard.py:97:    institution_question_counts = [{"name": r[0], "count": r[1]} for r in inst_q_rows]
+smartkcet/admin/dashboard.py:150:            Subscription.institution_id == Institution.id,
+smartkcet/admin/dashboard.py:165:            "institution_id": inst_id,
+smartkcet/admin/dashboard.py:181:        .join(Subscription, Subscription.institution_id == Institution.id)
+smartkcet/admin/dashboard.py:235:            func.count(case((IndexedFile.institution_id.is_(None), 1))),
+smartkcet/admin/dashboard.py:236:            func.count(IndexedFile.institution_id)
+smartkcet/admin/dashboard.py:245:        .where(User.role == "student", User.institution_id.is_(None))
+smartkcet/admin/dashboard.py:339:            "total_questions": int(admin_questions_total + institution_questions_total),
+smartkcet/admin/dashboard.py:340:            "admin_questions": int(admin_questions_total),
+smartkcet/admin/dashboard.py:341:            "institution_questions": int(institution_questions_total),
+smartkcet/admin/dashboard.py:353:        # Question bank breakdown
+smartkcet/admin/dashboard.py:354:        "question_bank": {
+smartkcet/admin/dashboard.py:356:            "institution_by_institution": institution_question_counts,
+smartkcet/admin/exams.py:12:  :mod:`.upload`, :mod:`.generate`, and :mod:`.questions` so the admin
+smartkcet/admin/exams.py:20:    Counts the requested subject's questions; aborts with 422 when the
+smartkcet/admin/exams.py:21:    bank holds fewer than :data:`QUESTIONS_PER_EXAM` (80) rows.  On
+smartkcet/admin/exams.py:22:    sufficient stock it draws 80 random questions, partitions them into
+smartkcet/admin/exams.py:24:    sets + 80 set-question rows in a single SQL transaction.  Any
+smartkcet/admin/exams.py:57:    ExamSetQuestion,
+smartkcet/admin/exams.py:58:    Question,
+smartkcet/admin/exams.py:69:# REQ-7.1 — exam contract: 4 sets × 60 questions = 240 total.  Defined as
+smartkcet/admin/exams.py:73:QUESTIONS_PER_SET = 60
+smartkcet/admin/exams.py:74:QUESTIONS_PER_EXAM = QUESTIONS_PER_SET * len(SET_LABELS)  # 240
+smartkcet/admin/exams.py:115:    source: Optional[str] = None  # 'question_paper' | 'textbook' | None (both)
+smartkcet/admin/exams.py:117:    institution_id: Optional[str] = None
+smartkcet/admin/exams.py:137:    inst_id = _get_effective_institution_id(_admin, session)
+smartkcet/admin/exams.py:139:        payload.institution_id = inst_id
+smartkcet/admin/exams.py:149:    # Retrieve directly from the stored questions in Question Bank
+smartkcet/admin/exams.py:153:def _get_effective_institution_id(payload: dict, session: Session) -> str:
+smartkcet/admin/exams.py:158:    user_inst_id = payload.get("institution_id") if isinstance(payload, dict) else None
+smartkcet/admin/exams.py:164:        if user_row and user_row.institution_id:
+smartkcet/admin/exams.py:165:            user_inst_id = str(user_row.institution_id)
+smartkcet/admin/exams.py:167:    # Institution users & institution admins are strictly locked to their institution_id
+smartkcet/admin/exams.py:172:    req_inst = request.args.get("institution_id")
+smartkcet/admin/exams.py:182:def _get_clean_unique_questions(session: Session, subject_val: str, source_filter: Optional[str] = None, institution_id: Optional[str] = None)-> list[Question]:
+smartkcet/admin/exams.py:183:    """Return all valid, complete, deduplicated Question rows for the given subject,
+smartkcet/admin/exams.py:184:    ordered with most recently added/generated questions prioritized."""
+smartkcet/admin/exams.py:185:    from ..rag.mcq_extractor import is_valid_question
+smartkcet/admin/exams.py:189:        select(Question)
+smartkcet/admin/exams.py:190:        .where(Question.subject == subject_val)
+smartkcet/admin/exams.py:191:        .order_by(Question.created_at.desc(), Question.id.desc())
+smartkcet/admin/exams.py:194:    if institution_id and str(institution_id).strip().lower() != "all":
+smartkcet/admin/exams.py:195:        inst_str = str(institution_id).strip().lower()
+smartkcet/admin/exams.py:197:            stmt = stmt.where(Question.institution_id.is_(None))
+smartkcet/admin/exams.py:200:                inst_uuid = uuid.UUID(str(institution_id).strip())
+smartkcet/admin/exams.py:206:                stmt = stmt.where(Question.institution_id == inst_uuid)
+smartkcet/admin/exams.py:210:                filtered_stmt = stmt.where(Question.source_type.in_(("textbook", "rag")))
+smartkcet/admin/exams.py:212:                filtered_stmt = stmt.where(Question.source_type == source_filter)
+smartkcet/admin/exams.py:214:            if len(rows) < QUESTIONS_PER_EXAM:
+smartkcet/admin/exams.py:226:    clean_rows: list[Question] = []
+smartkcet/admin/exams.py:229:        if not r.question_text:
+smartkcet/admin/exams.py:231:        norm_text = r.question_text.strip().lower()
+smartkcet/admin/exams.py:242:        if not is_valid_question(r.question_text, opts, subject=subject_val):
+smartkcet/admin/exams.py:252:    """Draw questions from the DB question bank and build a 1-set exam (Set A with 60 questions).
+smartkcet/admin/exams.py:254:    Guarantees clean, authentic questions and allows multiple 60-question exams to be created from
+smartkcet/admin/exams.py:255:    the 240 questions generated in the Question Bank.
+smartkcet/admin/exams.py:258:    inst_id_filter = payload.institution_id
+smartkcet/admin/exams.py:260:    # Step 1: Query clean, unique questions stored in the Question Bank for this subject & institution
+smartkcet/admin/exams.py:261:    clean_questions = _get_clean_unique_questions(session, subject_val, source_filter, institution_id=inst_id_filter)
+smartkcet/admin/exams.py:263:    # Query questions already linked to previous exams for this subject & institution
+smartkcet/admin/exams.py:265:        select(ExamSetQuestion.question_id)
+smartkcet/admin/exams.py:266:        .join(ExamSet, ExamSet.id == ExamSetQuestion.exam_set_id)
+smartkcet/admin/exams.py:273:            linked_stmt = linked_stmt.where(Exam.institution_id == i_uuid)
+smartkcet/admin/exams.py:279:    from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question, normalize_question_fingerprint
+smartkcet/admin/exams.py:282:        normalize_question_fingerprint(q.question_text)
+smartkcet/admin/exams.py:283:        for q in clean_questions
+smartkcet/admin/exams.py:284:        if (q.id in already_used_ids and q.question_text)
+smartkcet/admin/exams.py:287:    # Exclude all questions already used in previous exams for this subject
+smartkcet/admin/exams.py:288:    available_questions = [
+smartkcet/admin/exams.py:289:        q for q in clean_questions
+smartkcet/admin/exams.py:291:        and normalize_question_fingerprint(q.question_text) not in already_used_fingerprints
+smartkcet/admin/exams.py:294:    # Guarantee at least QUESTIONS_PER_SET (60) FRESH, unrepeated questions across full syllabus
+smartkcet/admin/exams.py:296:    for q in clean_questions:
+smartkcet/admin/exams.py:297:        if q.question_text:
+smartkcet/admin/exams.py:298:            used_texts.add(q.question_text.strip())
+smartkcet/admin/exams.py:299:            used_texts.add(normalize_question_fingerprint(q.question_text))
+smartkcet/admin/exams.py:308:    if len(available_questions) < QUESTIONS_PER_SET:
+smartkcet/admin/exams.py:310:            "error": "insufficient_questions",
+smartkcet/admin/exams.py:312:            "count": len(available_questions),
+smartkcet/admin/exams.py:313:            "required": QUESTIONS_PER_SET,
+smartkcet/admin/exams.py:314:            "message": f"Not enough unused questions available in Question Bank for {subject_val} ({len(available_questions)} available, {QUESTIONS_PER_SET} required). Please upload more question papers first."
+smartkcet/admin/exams.py:317:    from ..rag.blueprint import allocate_blueprint_questions
+smartkcet/admin/exams.py:319:    # Step 2: Draw exactly 60 unique questions adhering strictly to KCET 2026 full syllabus blueprint
+smartkcet/admin/exams.py:320:    sampled_rows = allocate_blueprint_questions(
+smartkcet/admin/exams.py:321:        available_questions=available_questions,
+smartkcet/admin/exams.py:324:        total_questions=QUESTIONS_PER_SET,
+smartkcet/admin/exams.py:339:    if payload.institution_id:
+smartkcet/admin/exams.py:341:            exam_inst_id = uuid.UUID(payload.institution_id)
+smartkcet/admin/exams.py:357:        institution_id=exam_inst_id,
+smartkcet/admin/exams.py:368:                ExamSetQuestion(
+smartkcet/admin/exams.py:370:                    question_id=qid,
+smartkcet/admin/exams.py:379:                "question_count": len(qids),
+smartkcet/admin/exams.py:403:    3. Invokes Groq LLM to generate fresh questions anchored to textbook context.
+smartkcet/admin/exams.py:405:    5. Stores questions in the database with source_type='rag' and constructs 4 sets (A/B/C/D).
+smartkcet/admin/exams.py:412:    from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question
+smartkcet/admin/exams.py:486:    generated_questions: list[dict] = []
+smartkcet/admin/exams.py:487:    used_questions: set[str] = set()
+smartkcet/admin/exams.py:498:                used_questions=used_questions,
+smartkcet/admin/exams.py:499:                questions_needed=QUESTIONS_PER_SET,
+smartkcet/admin/exams.py:502:            logger.info("Set %s: generated %d KCET questions via Groq RAG LLM", label, len(set_qs))
+smartkcet/admin/exams.py:504:            logger.warning("Groq RAG generation for set %s failed or key missing: %s. Using authentic RAG question bank.", label, e)
+smartkcet/admin/exams.py:507:        # Top up this set if fewer than QUESTIONS_PER_SET were returned
+smartkcet/admin/exams.py:508:        if len(set_qs) < QUESTIONS_PER_SET:
+smartkcet/admin/exams.py:509:            needed = QUESTIONS_PER_SET - len(set_qs)
+smartkcet/admin/exams.py:516:                    min_questions=needed,
+smartkcet/admin/exams.py:517:                    used_questions=used_questions,
+smartkcet/admin/exams.py:521:                    if q["q"] not in used_questions and is_valid_question(q["q"], q["opts"], subject=subject_name):
+smartkcet/admin/exams.py:523:                        used_questions.add(q["q"])
+smartkcet/admin/exams.py:524:                        if len(set_qs) >= QUESTIONS_PER_SET:
+smartkcet/admin/exams.py:530:            used_questions.add(q.get("q", ""))
+smartkcet/admin/exams.py:531:        generated_questions.extend(set_qs[:QUESTIONS_PER_SET])
+smartkcet/admin/exams.py:533:    # Final safeguard: if total < QUESTIONS_PER_EXAM, top up
+smartkcet/admin/exams.py:534:    if len(generated_questions) < QUESTIONS_PER_EXAM:
+smartkcet/admin/exams.py:535:        clean_db_questions = _get_clean_unique_questions(session, subject_name)
+smartkcet/admin/exams.py:536:        random.shuffle(clean_db_questions)
+smartkcet/admin/exams.py:537:        for q_row in clean_db_questions:
+smartkcet/admin/exams.py:538:            if q_row.question_text and q_row.question_text not in used_questions:
+smartkcet/admin/exams.py:546:                    generated_questions.append({
+smartkcet/admin/exams.py:547:                        "q": q_row.question_text,
+smartkcet/admin/exams.py:553:                    used_questions.add(q_row.question_text)
+smartkcet/admin/exams.py:554:                    if len(generated_questions) >= QUESTIONS_PER_EXAM:
+smartkcet/admin/exams.py:557:    # Step 4.5: Ensure sufficient pool of questions
+smartkcet/admin/exams.py:558:    if len(generated_questions) < QUESTIONS_PER_EXAM + 20:
+smartkcet/admin/exams.py:559:        shortfall = (QUESTIONS_PER_EXAM + 20) - len(generated_questions)
+smartkcet/admin/exams.py:560:        extra = extract_or_generate_mcqs(context_str, topic=subject_name, min_questions=shortfall + 20, used_questions=used_questions)
+smartkcet/admin/exams.py:562:            if q["q"] not in used_questions and is_valid_question(q["q"], q["opts"], subject=subject_name):
+smartkcet/admin/exams.py:563:                generated_questions.append(q)
+smartkcet/admin/exams.py:564:                used_questions.add(q["q"])
+smartkcet/admin/exams.py:565:                if len(generated_questions) >= QUESTIONS_PER_EXAM + 20:
+smartkcet/admin/exams.py:568:    # ── Step 5: Store questions in DB as source_type='rag'
+smartkcet/admin/exams.py:570:    for q_dict in generated_questions:
+smartkcet/admin/exams.py:571:        if len(stored_ids) >= QUESTIONS_PER_EXAM:
+smartkcet/admin/exams.py:576:        q_row = Question(
+smartkcet/admin/exams.py:578:            question_text=q_dict.get("q", "").strip(),
+smartkcet/admin/exams.py:584:            institution_id=None,
+smartkcet/admin/exams.py:593:            logger.warning("Failed to flush question: %s", exc)
+smartkcet/admin/exams.py:595:    if len(stored_ids) < QUESTIONS_PER_EXAM:
+smartkcet/admin/exams.py:598:            "error": "question_storage_failed",
+smartkcet/admin/exams.py:600:            "required": QUESTIONS_PER_EXAM,
+smartkcet/admin/exams.py:601:            "message": "Failed to store enough generated questions in the database.",
+smartkcet/admin/exams.py:604:    # ── Step 6: Atomically create Exam + 4 ExamSets + 80 ExamSetQuestion links
+smartkcet/admin/exams.py:606:    if payload.institution_id:
+smartkcet/admin/exams.py:608:            exam_inst_id = uuid.UUID(payload.institution_id)
+smartkcet/admin/exams.py:617:        institution_id=exam_inst_id,
+smartkcet/admin/exams.py:622:        base_60 = stored_ids[:QUESTIONS_PER_SET]
+smartkcet/admin/exams.py:637:                ExamSetQuestion(exam_set_id=exam_set.id, question_id=qid, order_index=oi)
+smartkcet/admin/exams.py:643:                "question_count": QUESTIONS_PER_SET,
+smartkcet/admin/exams.py:652:        "RAG exam created: id=%s subject=%s chapters_used=%d questions=%d",
+smartkcet/admin/exams.py:662:        "questions_generated": len(stored_ids),
+smartkcet/admin/exams.py:742:            session.execute(delete(ExamSetQuestion).where(ExamSetQuestion.exam_set_id.in_(set_ids)))
+smartkcet/admin/exams.py:766:    inst_id = _get_effective_institution_id(_admin, session)
+smartkcet/admin/exams.py:783:        .outerjoin(Institution, Institution.id == Exam.institution_id)
+smartkcet/admin/exams.py:792:            stmt = stmt.where(Exam.institution_id.is_(None))
+smartkcet/admin/exams.py:800:                stmt = stmt.where(Exam.institution_id == inst_uuid)
+smartkcet/admin/exams.py:809:        is_inst = exam.institution_id is not None
+smartkcet/admin/exams.py:818:                "institution_id": str(exam.institution_id) if is_inst else None,
+smartkcet/admin/exams.py:832:# GET /api/admin/exams/{exam_id}  (inspect sets & questions)
+smartkcet/admin/exams.py:838:    """Return the exam with all sets (A/B/C/D) and their assigned questions."""
+smartkcet/admin/exams.py:856:            session.query(Question, ExamSetQuestion.order_index)
+smartkcet/admin/exams.py:857:            .join(ExamSetQuestion, ExamSetQuestion.question_id == Question.id)
+smartkcet/admin/exams.py:858:            .filter(ExamSetQuestion.exam_set_id == s.id)
+smartkcet/admin/exams.py:859:            .order_by(ExamSetQuestion.order_index.asc())
+smartkcet/admin/exams.py:862:        questions_list = []
+smartkcet/admin/exams.py:870:            questions_list.append({
+smartkcet/admin/exams.py:873:                "q": q.question_text,
+smartkcet/admin/exams.py:874:                "question": q.question_text,
+smartkcet/admin/exams.py:887:            "question_count": len(questions_list),
+smartkcet/admin/exams.py:888:            "questions": questions_list,
+smartkcet/admin/exams.py:898:        "total_questions": sum(len(s["questions"]) for s in sets_data),
+smartkcet/admin/exams.py:905:    "QUESTIONS_PER_SET",
+smartkcet/admin/exams.py:906:    "QUESTIONS_PER_EXAM",
+smartkcet/admin/generate.py:1:"""Admin question-generation endpoint — DB-driven question bank.
+smartkcet/admin/generate.py:3:Generates 4 paper sets (A/B/C/D) by querying the questions table for the
+smartkcet/admin/generate.py:4:selected subject and randomly partitioning available questions into
+smartkcet/admin/generate.py:7:No external API calls are made. Questions come entirely from the DB,
+smartkcet/admin/generate.py:41:from ..db.models import Question, Subject
+smartkcet/admin/generate.py:47:# enhancement (e.g., AI-powered question generation when DB is empty).
+smartkcet/admin/generate.py:57:# Generation contract: 4 sets, up to 60 questions each = up to 240 total.
+smartkcet/admin/generate.py:59:QUESTIONS_PER_SET = 60
+smartkcet/admin/generate.py:60:MIN_TOTAL_QUESTIONS = 20  # Minimum to generate any sets at all
+smartkcet/admin/generate.py:113:def _question_row_to_dict(row: Question, set_label: str, index: int)-> dict:
+smartkcet/admin/generate.py:114:    """Convert a Question ORM row to the frontend-expected dict format."""
+smartkcet/admin/generate.py:127:        "q": row.question_text,
+smartkcet/admin/generate.py:142:    """Generate 4 paper sets (60 questions per set = 240 total unique questions)
+smartkcet/admin/generate.py:143:    from the question bank for the chosen subject with zero overlap across sets.
+smartkcet/admin/generate.py:156:    required_total = len(SET_LABELS) * QUESTIONS_PER_SET  # 4 * 60 = 240
+smartkcet/admin/generate.py:174:    # Query all questions for this subject from the DB
+smartkcet/admin/generate.py:176:        select(Question)
+smartkcet/admin/generate.py:177:        .where(Question.subject == subject_name)
+smartkcet/admin/generate.py:179:    db_questions = list(session.execute(stmt).scalars().all())
+smartkcet/admin/generate.py:181:    # If uploaded topics exist, filter strictly to questions matching uploaded topics
+smartkcet/admin/generate.py:183:        all_questions = [q for q in db_questions if is_topic_matching(q.topic, uploaded_topics)]
+smartkcet/admin/generate.py:185:            "Filtered %d DB questions to %d matching uploaded topics for %s",
+smartkcet/admin/generate.py:186:            len(db_questions),
+smartkcet/admin/generate.py:187:            len(all_questions),
+smartkcet/admin/generate.py:191:        all_questions = db_questions
+smartkcet/admin/generate.py:193:    existing_texts = set(q.question_text for q in all_questions if q.question_text)
+smartkcet/admin/generate.py:195:    # If fewer than 240 questions in DB, generate strictly from uploaded material & syllabus
+smartkcet/admin/generate.py:196:    if len(all_questions) < required_total:
+smartkcet/admin/generate.py:197:        needed = required_total - len(all_questions)
+smartkcet/admin/generate.py:198:        from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question
+smartkcet/admin/generate.py:207:                curr_topic_qs = sum(1 for q in all_questions if is_topic_matching(q.topic, [top]))
+smartkcet/admin/generate.py:213:                        min_questions=shortfall,
+smartkcet/admin/generate.py:214:                        used_questions=existing_texts,
+smartkcet/admin/generate.py:242:                min_questions=needed + 10,
+smartkcet/admin/generate.py:243:                used_questions=existing_texts,
+smartkcet/admin/generate.py:251:            if not is_valid_question(q_text, opts, subject=subject_name):
+smartkcet/admin/generate.py:253:            from ..rag.mcq_extractor import shuffle_question_options
+smartkcet/admin/generate.py:254:            shuffled_opts, new_ans = shuffle_question_options(opts, mcq.get("ans", 0))
+smartkcet/admin/generate.py:255:            row = Question(
+smartkcet/admin/generate.py:257:                question_text=q_text,
+smartkcet/admin/generate.py:262:                institution_id=None,
+smartkcet/admin/generate.py:267:            all_questions.append(row)
+smartkcet/admin/generate.py:271:            logger.info("Committed %d generated questions for %s into Question Bank", len(topup_mcqs), subject_name)
+smartkcet/admin/generate.py:274:            logger.warning("Failed to commit generated questions in generate: %s", exc)
+smartkcet/admin/generate.py:276:    total_available = len(all_questions)
+smartkcet/admin/generate.py:278:        "Generate request for %s: %d questions available",
+smartkcet/admin/generate.py:283:    # Deduplicate strictly by question_text
+smartkcet/admin/generate.py:285:    distinct_questions = []
+smartkcet/admin/generate.py:286:    for q in all_questions:
+smartkcet/admin/generate.py:287:        txt = (q.question_text or "").strip()
+smartkcet/admin/generate.py:290:            distinct_questions.append(q)
+smartkcet/admin/generate.py:291:    all_questions = distinct_questions
+smartkcet/admin/generate.py:297:        QUESTIONS_PER_SET,
+smartkcet/admin/generate.py:300:    # Partition questions into 4 non-overlapping sets of 60 questions each adhering to blueprint quotas
+smartkcet/admin/generate.py:301:    sets_rows: list[list[Question]] = [[] for _ in range(len(SET_LABELS))]
+smartkcet/admin/generate.py:302:    by_topic: dict[str, list[Question]] = {}
+smartkcet/admin/generate.py:305:    for q in all_questions:
+smartkcet/admin/generate.py:315:    # Shuffle questions within each topic pool
+smartkcet/admin/generate.py:319:    # Allocate 1 base set of 60 questions strictly following official chapter quotas
+smartkcet/admin/generate.py:320:    base_set: list[Question] = []
+smartkcet/admin/generate.py:324:            if t_list and len(base_set) < QUESTIONS_PER_SET:
+smartkcet/admin/generate.py:327:    # Fill any minor shortfalls from remaining questions
+smartkcet/admin/generate.py:329:    remaining = [q for q in all_questions if id(q) not in placed_ids]
+smartkcet/admin/generate.py:331:    while len(base_set) < QUESTIONS_PER_SET and remaining:
+smartkcet/admin/generate.py:343:        set_questions = [
+smartkcet/admin/generate.py:344:            _question_row_to_dict(row, label, idx)
+smartkcet/admin/generate.py:348:            set_questions = [q for q in set_questions if is_topic_matching(q.get("topic"), uploaded_topics)]
+smartkcet/admin/generate.py:349:        sets.append(set_questions)
+smartkcet/admin/generate.py:354:        "Generated %d unique questions across 4 distinct sets for %s",
+smartkcet/admin/generate.py:369:__all__ = ["router", "SET_LABELS", "QUESTIONS_PER_SET"]
+smartkcet/admin/platform_admin_models.py:119:    question_count: int = 0
+smartkcet/admin/platform_admin_routes.py:187:                    'kcet_question_bank': False,
+smartkcet/admin/platform_admin_routes.py:205:                    'kcet_question_bank': True,
+smartkcet/admin/platform_admin_routes.py:223:                    'kcet_question_bank': True,
+smartkcet/admin/platform_admin_routes.py:241:                    'kcet_question_bank': True,
+smartkcet/admin/platform_admin_routes.py:259:                    'institution_question_bank': False,
+smartkcet/admin/platform_admin_routes.py:278:                    'institution_question_bank': True,
+smartkcet/admin/platform_admin_routes.py:297:                    'institution_question_bank': 'Full',
+smartkcet/admin/platform_admin_routes.py:316:                    'institution_question_bank': 'Full',
+smartkcet/admin/platform_admin_routes.py:413:@router.route("/institutions/<institution_id>/activate", methods=["POST"])
+smartkcet/admin/platform_admin_routes.py:414:def activate_institution(institution_id: UUID)-> InstitutionResponse:    
+smartkcet/admin/platform_admin_routes.py:429:        institution = service.activate_institution(institution_id)
+smartkcet/admin/platform_admin_routes.py:438:@router.route("/institutions/<institution_id>/suspend", methods=["POST"])
+smartkcet/admin/platform_admin_routes.py:439:def suspend_institution(institution_id: UUID)-> InstitutionResponse:    
+smartkcet/admin/platform_admin_routes.py:454:        institution = service.suspend_institution(institution_id)
+smartkcet/admin/platform_admin_routes.py:463:@router.route("/institutions/<institution_id>", methods=["DELETE"])
+smartkcet/admin/platform_admin_routes.py:464:def remove_institution(institution_id: UUID)-> SuccessResponse:    
+smartkcet/admin/platform_admin_routes.py:480:        service.remove_institution(institution_id)
+smartkcet/admin/platform_admin_routes.py:483:            message=f"Institution {institution_id} removed successfully",
+smartkcet/admin/platform_admin_routes.py:500:    from ..db.models import User, Question, Exam
+smartkcet/admin/platform_admin_routes.py:519:            Subscription.institution_id,
+smartkcet/admin/platform_admin_routes.py:523:        .filter(Subscription.institution_id.in_(inst_ids))
+smartkcet/admin/platform_admin_routes.py:531:        db.query(User.institution_id, func.count(User.id))
+smartkcet/admin/platform_admin_routes.py:532:        .filter(User.role == 'student', User.institution_id.in_(inst_ids))
+smartkcet/admin/platform_admin_routes.py:533:        .group_by(User.institution_id)
+smartkcet/admin/platform_admin_routes.py:537:    # Grouped SQL aggregate question counts in 1 SQL query
+smartkcet/admin/platform_admin_routes.py:538:    question_counts = dict(
+smartkcet/admin/platform_admin_routes.py:539:        db.query(Question.institution_id, func.count(Question.id))
+smartkcet/admin/platform_admin_routes.py:540:        .filter(Question.institution_id.in_(inst_ids))
+smartkcet/admin/platform_admin_routes.py:541:        .group_by(Question.institution_id)
+smartkcet/admin/platform_admin_routes.py:547:        db.query(Exam.institution_id, func.count(Exam.id))
+smartkcet/admin/platform_admin_routes.py:548:        .filter(Exam.institution_id.in_(inst_ids))
+smartkcet/admin/platform_admin_routes.py:549:        .group_by(Exam.institution_id)
+smartkcet/admin/platform_admin_routes.py:568:            question_count=int(question_counts.get(inst.id, 0)),
+smartkcet/admin/platform_admin_routes.py:586:def list_students(student_type: Optional[str] = None, institution_id: Optional[UUID] = None):    
+smartkcet/admin/platform_admin_routes.py:593:    inst_id_raw = request.args.get("institution_id") or institution_id
+smartkcet/admin/platform_admin_routes.py:609:        or_(User.institution_id.isnot(None), User.student_subtype.in_(['institution_linked', 'dual']))
+smartkcet/admin/platform_admin_routes.py:614:        or_(User.institution_id.is_(None), User.student_subtype.in_(['direct_subscriber', 'dual']))
+smartkcet/admin/platform_admin_routes.py:626:        Institution, Institution.id == User.institution_id
+smartkcet/admin/platform_admin_routes.py:631:            or_(User.institution_id.is_(None), User.student_subtype.in_(['direct_subscriber', 'dual']))
+smartkcet/admin/platform_admin_routes.py:635:            or_(User.institution_id.isnot(None), User.student_subtype.in_(['institution_linked', 'dual']))
+smartkcet/admin/platform_admin_routes.py:638:            query = query.where(User.institution_id == inst_id)
+smartkcet/admin/platform_admin_routes.py:640:        query = query.where(User.institution_id == inst_id)
+smartkcet/admin/platform_admin_routes.py:662:        if user.institution_id or user.student_subtype == "institution_linked":
+smartkcet/admin/platform_admin_routes.py:671:        sub_status = active_sub_status if has_active_sub else ("active" if user.institution_id else "trial")
+smartkcet/admin/platform_admin_routes.py:684:            "institution_id": str(user.institution_id) if user.institution_id else None,
+smartkcet/admin/platform_admin_routes.py:753:    if user.institution_id:
+smartkcet/admin/platform_admin_routes.py:754:        inst = db.query(Institution).filter(Institution.id == user.institution_id).first()
+smartkcet/admin/platform_admin_routes.py:764:        "institution_id": str(user.institution_id) if user.institution_id else None,
+smartkcet/admin/platform_admin_service.py:301:    def activate_institution(self, institution_id: UUID | str)-> Institution:
+smartkcet/admin/platform_admin_service.py:305:            institution_id: Institution ID to activate
+smartkcet/admin/platform_admin_service.py:313:        if isinstance(institution_id, str):
+smartkcet/admin/platform_admin_service.py:315:                institution_id = UUID(institution_id)
+smartkcet/admin/platform_admin_service.py:320:            Institution.id == institution_id
+smartkcet/admin/platform_admin_service.py:324:            raise ValueError(f"Institution {institution_id} not found")
+smartkcet/admin/platform_admin_service.py:335:            target_id=str(institution_id),
+smartkcet/admin/platform_admin_service.py:345:    def suspend_institution(self, institution_id: UUID | str)-> Institution:
+smartkcet/admin/platform_admin_service.py:349:            institution_id: Institution ID to suspend
+smartkcet/admin/platform_admin_service.py:357:        if isinstance(institution_id, str):
+smartkcet/admin/platform_admin_service.py:359:                institution_id = UUID(institution_id)
+smartkcet/admin/platform_admin_service.py:364:            Institution.id == institution_id
+smartkcet/admin/platform_admin_service.py:368:            raise ValueError(f"Institution {institution_id} not found")
+smartkcet/admin/platform_admin_service.py:379:            target_id=str(institution_id),
+smartkcet/admin/platform_admin_service.py:389:    def remove_institution(self, institution_id: UUID | str)-> None:
+smartkcet/admin/platform_admin_service.py:395:            institution_id: Institution ID to remove
+smartkcet/admin/platform_admin_service.py:400:        if isinstance(institution_id, str):
+smartkcet/admin/platform_admin_service.py:402:                institution_id = UUID(institution_id)
+smartkcet/admin/platform_admin_service.py:407:            Institution.id == institution_id
+smartkcet/admin/platform_admin_service.py:411:            raise ValueError(f"Institution {institution_id} not found")
+smartkcet/admin/platform_admin_service.py:421:            target_id=str(institution_id),
+smartkcet/admin/platform_admin_service.py:519:            Subscription.institution_id.isnot(None)
+smartkcet/admin/questions.py:1:"""Admin Question_Bank management endpoints.
+smartkcet/admin/questions.py:5:Question_Bank surface.
+smartkcet/admin/questions.py:7:* Mounted under ``/api/admin/questions`` from :mod:`smartkcet.admin`.
+smartkcet/admin/questions.py:17:``GET /api/admin/questions``
+smartkcet/admin/questions.py:26:``DELETE /api/admin/questions/{question_id}``
+smartkcet/admin/questions.py:33:``GET /api/admin/questions/counts``
+smartkcet/admin/questions.py:35:    admin UI can render the "fewer than 20 questions" warning without
+smartkcet/admin/questions.py:54:from ..db.models import Question, Subject
+smartkcet/admin/questions.py:58:logger = logging.getLogger("smartkcet.admin.questions")
+smartkcet/admin/questions.py:60:router = Blueprint("admin_questions", __name__)
+smartkcet/admin/questions.py:69:# REQ-6.4 — "insufficient questions" threshold.  Exposed in the counts
+smartkcet/admin/questions.py:100:def _serialise_question(row: Question)-> dict[str, Any]:
+smartkcet/admin/questions.py:101:    """Map a :class:`Question` ORM row to the JSON shape expected by all frontend components."""
+smartkcet/admin/questions.py:120:        "question": row.question_text,
+smartkcet/admin/questions.py:121:        "question_text": row.question_text,
+smartkcet/admin/questions.py:122:        "q": row.question_text,
+smartkcet/admin/questions.py:138:def _get_effective_institution_id(payload: dict, session: Session) -> str:
+smartkcet/admin/questions.py:143:    user_inst_id = payload.get("institution_id") if isinstance(payload, dict) else None
+smartkcet/admin/questions.py:145:        user_row = session.query(Question.__class__).none() if False else None
+smartkcet/admin/questions.py:150:        if user_row and user_row.institution_id:
+smartkcet/admin/questions.py:151:            user_inst_id = str(user_row.institution_id)
+smartkcet/admin/questions.py:153:    # Institution users & institution admins are strictly locked to their institution_id
+smartkcet/admin/questions.py:158:    req_inst = request.args.get("institution_id")
+smartkcet/admin/questions.py:168:def _counts_by_subject(session: Session, institution_id: Optional[str] = None)-> dict[str, int]:
+smartkcet/admin/questions.py:169:    """Return a ``{subject_value: count}`` map for questions.
+smartkcet/admin/questions.py:171:    Supports filtering by institution_id ('all', 'platform'/'null', or specific UUID).
+smartkcet/admin/questions.py:172:    Defaults to counting all questions if institution_id is None or 'all'.
+smartkcet/admin/questions.py:175:    stmt = select(Question.subject, func.count(Question.id))
+smartkcet/admin/questions.py:176:    if institution_id and str(institution_id).strip().lower() != "all":
+smartkcet/admin/questions.py:177:        inst_str = str(institution_id).strip().lower()
+smartkcet/admin/questions.py:179:            stmt = stmt.where(Question.institution_id.is_(None))
+smartkcet/admin/questions.py:182:                inst_uuid = uuid.UUID(str(institution_id).strip())
+smartkcet/admin/questions.py:188:                stmt = stmt.where(Question.institution_id == inst_uuid)
+smartkcet/admin/questions.py:190:    rows = session.execute(stmt.group_by(Question.subject)).all()
+smartkcet/admin/questions.py:196:# GET /api/admin/questions/counts  (must be declared BEFORE the {question_id}
+smartkcet/admin/questions.py:202:@router.route("/questions/counts", methods=["GET"])
+smartkcet/admin/questions.py:209:    REQ-6.4: a subject is "insufficient" when its total question count
+smartkcet/admin/questions.py:214:    inst_id = _get_effective_institution_id(_admin, session)
+smartkcet/admin/questions.py:215:    counts = _counts_by_subject(session, institution_id=inst_id)
+smartkcet/admin/questions.py:228:# GET /api/admin/questions
+smartkcet/admin/questions.py:232:@router.route("/questions", methods=["GET"])
+smartkcet/admin/questions.py:233:def list_questions() -> Any:
+smartkcet/admin/questions.py:239:    inst_id = _get_effective_institution_id(_admin, session)
+smartkcet/admin/questions.py:269:    # Build the base SELECT — default to all extracted questions (unless specific institution_id filter is requested).
+smartkcet/admin/questions.py:274:            base_filter.append(Question.institution_id.is_(None))
+smartkcet/admin/questions.py:283:                base_filter.append(Question.institution_id == inst_uuid)
+smartkcet/admin/questions.py:288:            base_filter.append(Question.generation_batch_id == b_uuid)
+smartkcet/admin/questions.py:293:        base_filter.append(Question.subject == selected.value)
+smartkcet/admin/questions.py:295:        base_filter.append(Question.source_type == source.strip())
+smartkcet/admin/questions.py:297:    total_stmt = select(func.count(Question.id))
+smartkcet/admin/questions.py:303:        select(Question)
+smartkcet/admin/questions.py:304:        .order_by(Question.created_at.desc(), Question.id.asc())
+smartkcet/admin/questions.py:313:        "questions": [_serialise_question(r) for r in rows],
+smartkcet/admin/questions.py:318:        "counts_by_subject": _counts_by_subject(session, institution_id=inst_id),
+smartkcet/admin/questions.py:323:# DELETE /api/admin/questions/{question_id}
+smartkcet/admin/questions.py:327:@router.route("/questions/<question_id>", methods=["DELETE"])
+smartkcet/admin/questions.py:328:def delete_question(question_id: uuid.UUID) -> Any:
+smartkcet/admin/questions.py:332:    """Delete a single question, reporting DB-level success or failure.
+smartkcet/admin/questions.py:343:    operation as failed and SHALL keep the question visible") so we
+smartkcet/admin/questions.py:347:    qid_str = str(question_id)
+smartkcet/admin/questions.py:351:            delete(Question).where(Question.id == question_id)
+smartkcet/admin/questions.py:366:        logger.warning("DELETE /api/admin/questions/%s failed: %s", qid_str, exc)
+smartkcet/admin/questions.py:373:# POST /api/admin/questions/clear
+smartkcet/admin/questions.py:377:@router.route("/questions/clear", methods=["POST"])
+smartkcet/admin/questions.py:378:def clear_questions() -> Any:
+smartkcet/admin/questions.py:379:    """Clear all questions or clear questions for a specific subject."""
+smartkcet/admin/questions.py:387:        stmt = delete(Question).where(Question.institution_id.is_(None))
+smartkcet/admin/questions.py:389:            stmt = stmt.where(Question.subject == subject.strip())
+smartkcet/admin/questions.py:398:            "message": f"Successfully cleared {deleted_count} questions."
+smartkcet/admin/questions.py:402:        logger.warning("Failed to clear questions: %s", exc)
+smartkcet/admin/upload.py:38:from ..db.models import IndexedFile, Question, Subject
+smartkcet/admin/upload.py:40:from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question
+smartkcet/admin/upload.py:129:    """Check if a file with the same hash already exists for admin (institution_id IS NULL)."""
+smartkcet/admin/upload.py:133:        IndexedFile.institution_id.is_(None),
+smartkcet/admin/upload.py:138:def _record_indexed_file(db: Session, subject: str, filename: str, file_hash: str, file_size: int, chunk_count: int, file_type: str = "question_paper")-> IndexedFile:
+smartkcet/admin/upload.py:139:    """Insert a new admin IndexedFile record (institution_id=NULL) and commit."""
+smartkcet/admin/upload.py:147:        institution_id=None,  # admin/global
+smartkcet/admin/upload.py:178:def _clean_question_options(opts: Any) -> List[str]:
+smartkcet/admin/upload.py:202:    opts = _clean_question_options(mcq.get("opts", []))
+smartkcet/admin/upload.py:205:    if not is_valid_question(q_text, opts, subject=subject):
+smartkcet/admin/upload.py:218:def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uuid.UUID, source_type: str = "question_paper")-> int:
+smartkcet/admin/upload.py:219:    """Store extracted MCQs as platform-wide Question rows (institution_id=NULL).
+smartkcet/admin/upload.py:221:    Returns the number of questions successfully stored.
+smartkcet/admin/upload.py:229:        from ..rag.mcq_extractor import shuffle_question_options
+smartkcet/admin/upload.py:230:        shuffled_opts, new_ans = shuffle_question_options(valid["opts"], valid["ans"])
+smartkcet/admin/upload.py:232:        row = Question(
+smartkcet/admin/upload.py:234:            question_text=valid["q"],
+smartkcet/admin/upload.py:239:            institution_id=None,  # platform-wide
+smartkcet/admin/upload.py:282:            IndexedFile.institution_id.is_(None),
+smartkcet/admin/upload.py:328:            IndexedFile.institution_id.is_(None),
+smartkcet/admin/upload.py:346:            IndexedFile.institution_id.is_(None),
+smartkcet/admin/upload.py:354:        # Purge questions in DB matching this topic
+smartkcet/admin/upload.py:356:            select(Question).where(Question.subject == subject_val)
+smartkcet/admin/upload.py:374:        "Deleted indexed file '%s' (topic '%s') and %d associated questions",
+smartkcet/admin/upload.py:382:        "message": f"Deleted '{filename}' and purged {deleted_q_count} questions from Question Bank.",
+smartkcet/admin/upload.py:383:        "deleted_questions": deleted_q_count,
+smartkcet/admin/upload.py:387:# ─── DELETE /upload/clear — clear all indexed files and questions for a subject ─
+smartkcet/admin/upload.py:407:            IndexedFile.institution_id.is_(None),
+smartkcet/admin/upload.py:422:        select(Question).where(Question.subject == selected.value)
+smartkcet/admin/upload.py:434:    logger.info("Cleared all %d files and %d questions for %s", file_count, q_count, selected.value)
+smartkcet/admin/upload.py:438:        "message": f"Cleared all {file_count} files and {q_count} questions for {selected.value}.",
+smartkcet/admin/upload.py:440:        "cleared_questions": q_count,
+smartkcet/admin/upload.py:448:def upload_single(subject: Optional[str] = None, file_type: str = "question_paper", file: Any = None)-> Any:    
+smartkcet/admin/upload.py:457:    if file_type is None or file_type == "question_paper":
+smartkcet/admin/upload.py:458:        file_type = request.form.get("file_type") or request.args.get("file_type") or "question_paper"
+smartkcet/admin/upload.py:559:        min_questions=5,
+smartkcet/admin/upload.py:565:    questions_extracted = _store_mcqs_in_db(db, mcqs, selected.value, mcq_batch_id, source_type=file_type)
+smartkcet/admin/upload.py:567:        "File '%s' (topic '%s'): extracted %d MCQs into question bank for %s",
+smartkcet/admin/upload.py:570:        questions_extracted,
+smartkcet/admin/upload.py:580:        "questions_extracted": questions_extracted,
+smartkcet/admin/upload.py:581:        "message": f"Successfully indexed {len(chunks)} chunks, extracted {questions_extracted} questions",
+smartkcet/admin/upload.py:589:def upload(subject: Optional[str] = None, file_type: str = "question_paper", files: Optional[List[Any]] = None)-> Any:    
+smartkcet/admin/upload.py:602:    if file_type is None or file_type == "question_paper":
+smartkcet/admin/upload.py:603:        file_type = request.form.get("file_type") or request.args.get("file_type") or "question_paper"
+smartkcet/admin/upload.py:628:    total_questions_extracted = 0
+smartkcet/admin/upload.py:632:        logger.info("Admin preview mode: validating extracted questions for %s without persisting to DB", selected.value)
+smartkcet/admin/upload.py:633:        all_preview_questions: List[dict[str, Any]] = []
+smartkcet/admin/upload.py:634:        seen_questions = set()
+smartkcet/admin/upload.py:673:                min_questions=5,
+smartkcet/admin/upload.py:681:                if fingerprint in seen_questions:
+smartkcet/admin/upload.py:683:                seen_questions.add(fingerprint)
+smartkcet/admin/upload.py:684:                all_preview_questions.append({
+smartkcet/admin/upload.py:692:        total_questions_extracted = len(all_preview_questions)
+smartkcet/admin/upload.py:699:            "questions_extracted": total_questions_extracted,
+smartkcet/admin/upload.py:700:            "preview_questions": sorted(all_preview_questions, key=lambda item: item["q"].lower()),
+smartkcet/admin/upload.py:810:            min_questions=5,
+smartkcet/admin/upload.py:816:        questions_extracted = _store_mcqs_in_db(db, mcqs, selected.value, mcq_batch_id, source_type=file_type)
+smartkcet/admin/upload.py:818:            "File '%s' (topic '%s'): extracted %d MCQs into question bank for %s",
+smartkcet/admin/upload.py:821:            questions_extracted,
+smartkcet/admin/upload.py:827:        total_questions_extracted += questions_extracted
+smartkcet/admin/upload.py:834:        "questions_extracted": total_questions_extracted,
+smartkcet/admin/__init__.py:1:"""Admin-facing operations (question bank, exam authoring, analytics).
+smartkcet/admin/__init__.py:5:area (upload, generate, question bank, exam authoring, analytics) can
+smartkcet/admin/__init__.py:14:* ``POST /api/admin/generate``  — task 4.5 transactional 80-question
+smartkcet/admin/__init__.py:16:* ``GET  /api/admin/questions`` — task 6.1 paginated listing with
+smartkcet/admin/__init__.py:17:                                   subject filter (see :mod:`.questions`).
+smartkcet/admin/__init__.py:18:* ``DELETE /api/admin/questions/{id}`` — task 6.3 reported-status
+smartkcet/admin/__init__.py:19:                                   delete (see :mod:`.questions`).
+smartkcet/admin/__init__.py:20:* ``GET  /api/admin/questions/counts`` — task 6.4 per-subject totals
+smartkcet/admin/__init__.py:48:from .questions import router as questions_router
+smartkcet/admin/__init__.py:69:router.register_blueprint(questions_router)

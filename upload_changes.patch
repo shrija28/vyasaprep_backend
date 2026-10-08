@@ -1,0 +1,284 @@
+diff --git a/smartkcet/admin/upload.py b/smartkcet/admin/upload.py
+index f5a134d..82d1833 100644
+--- a/smartkcet/admin/upload.py
++++ b/smartkcet/admin/upload.py
+@@ -70,9 +70,10 @@ logger = logging.getLogger("smartkcet.admin.upload")
+ router = Blueprint("admin_upload", __name__)
+ 
+ 
+-# REQ-5.3 — matches the legacy ``/upload`` cap so admins don't experience
+-# a regression when migrating to the role-scoped endpoint.
+-MAX_FILES_PER_BATCH = 10
++# Supports large batches of PDFs (1, 2, 7, 10, 20, 50, etc.) without arbitrary low caps
++MAX_FILES_PER_BATCH = 100
++MAX_FILE_SIZE_MB = 100
++MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+ 
+ 
+ def _validation_error(message: str, field: Optional[str] = None):
+@@ -552,138 +553,140 @@ def upload(subject: Optional[str] = None, file_type: str = "question_paper", fil
+             field="files",
+         )
+ 
++    preview_only_str = request.form.get("preview_only") or request.args.get("preview_only")
++    preview_only = preview_only_str.lower() == "true" if preview_only_str else False
++
+     warnings: List[str] = []
+     already_indexed: List[dict[str, Any]] = []
++    failed_files: List[dict[str, Any]] = []
++    all_preview_questions: List[dict[str, Any]] = []
+     indexed_files = 0
+-    # Clear previously indexed files for this subject so only this uploaded batch defines the active scope
+-    try:
+-        old_files = db.execute(
+-            select(IndexedFile).where(
+-                IndexedFile.subject == selected.value,
+-                IndexedFile.institution_id.is_(None),
+-            )
+-        ).scalars().all()
+-        for of in old_files:
+-            db.delete(of)
+-        db.commit()
+-    except Exception as e:
+-        logger.warning("Could not clear previous indexed files: %s", e)
+-
+-    try:
+-        stores.clear(selected)
+-    except Exception as exc:
+-        logger.warning("Failed to reset store for %s: %s", selected.value, exc)
++    total_chunks = 0
++    total_questions_extracted = 0
+ 
+     for upload_file in files:
+         filename = upload_file.filename or ""
+-        content = upload_file.read()
+-        file_size = len(content)
+-        file_hash = _compute_file_hash(content)
+-
+-        logger.info("Processing file: %s (%d bytes, hash: %s)", filename, file_size, file_hash[:12])
++        if not filename:
++            continue
+ 
+-        # Duplicate detection
+-        existing = _check_duplicate(db, selected.value, file_hash)
+-        if existing is not None:
++        try:
++            content = upload_file.read()
++            file_size = len(content)
++
++            # File size check
++            if file_size > MAX_FILE_SIZE_BYTES:
++                msg = f"File size ({file_size / (1024*1024):.1f} MB) exceeds maximum supported limit ({MAX_FILE_SIZE_MB} MB)"
++                logger.warning("File '%s': %s", filename, msg)
++                failed_files.append({"filename": filename, "reason": msg})
++                continue
++
++            file_hash = _compute_file_hash(content)
++            logger.info("Processing file: %s (%d bytes, hash: %s)", filename, file_size, file_hash[:12])
++
++            # Duplicate detection
++            existing = _check_duplicate(db, selected.value, file_hash)
++            if existing is not None:
++                logger.info(
++                    "File '%s' is a duplicate of '%s' (hash: %s) → skipping",
++                    filename,
++                    existing.filename,
++                    file_hash[:12],
++                )
++                already_indexed.append({
++                    "filename": filename,
++                    "existing_filename": existing.filename,
++                    "file_hash": file_hash,
++                    "chunk_count": existing.chunk_count,
++                    "indexed_at": existing.indexed_at.isoformat() if existing.indexed_at else None,
++                })
++                continue
++
++            text = _extract_text(filename, content)
++            if text is None:
++                logger.warning("File '%s': unsupported format or extraction returned None", filename)
++                warnings.append(filename)
++                failed_files.append({"filename": filename, "reason": "Unsupported format or unreadable text"})
++                continue
++
++            if not text.strip():
++                logger.warning("File '%s': extraction returned empty text", filename)
++                warnings.append(filename)
++                failed_files.append({"filename": filename, "reason": "No text could be extracted from PDF"})
++                continue
++
++            chunks = chunk_text(text)
++            if not chunks:
++                logger.warning("File '%s': text too short to produce chunks", filename)
++                warnings.append(filename)
++                failed_files.append({"filename": filename, "reason": "Text content too short to index"})
++                continue
++
++            # Index into FAISS store
+             logger.info(
+-                "File '%s' is a duplicate of '%s' (hash: %s) → skipping",
++                "File '%s': extracted %d chars → %d chunks → indexing into %s",
+                 filename,
+-                existing.filename,
+-                file_hash[:12],
++                len(text.strip()),
++                len(chunks),
++                selected.value,
+             )
+-            already_indexed.append({
+-                "filename": filename,
+-                "existing_filename": existing.filename,
+-                "file_hash": file_hash,
+-                "chunk_count": existing.chunk_count,
+-                "indexed_at": existing.indexed_at.isoformat() if existing.indexed_at else None,
+-            })
+-            continue
+-
+-        text = _extract_text(filename, content)
+-        if text is None:
+-            logger.warning(
+-                "File '%s': unsupported extension or extraction returned None → added to warnings",
+-                filename,
++            try:
++                stores.add(selected, chunks)
++            except Exception as exc:
++                logger.warning("FAISS store indexing failed for %s: %s", filename, exc)
++
++            # Record in database (institution_id = NULL for Platform Admin master question bank)
++            _record_indexed_file(
++                db,
++                subject=selected.value,
++                filename=filename,
++                file_hash=file_hash,
++                file_size=file_size,
++                chunk_count=len(chunks),
++                file_type=file_type,
+             )
+-            warnings.append(filename)
+-            continue
+ 
+-        if not text.strip():
+-            logger.warning(
+-                "File '%s': extraction returned empty text (0 chars after strip) → added to warnings",
+-                filename,
++            # Persist copy to data/textbooks
++            try:
++                from pathlib import Path
++                save_dir = Path("data/textbooks")
++                save_dir.mkdir(parents=True, exist_ok=True)
++                safe_name = Path(filename).name
++                (save_dir / safe_name).write_bytes(content)
++            except Exception as exc:
++                logger.warning("Could not persist file copy to data/textbooks: %s", exc)
++
++            # Extract MCQs and automatically insert into Centralized Master Question Bank (institution_id = NULL)
++            file_topic = match_filename_to_topic(filename, selected.value)
++            mcq_batch_id = uuid.uuid4()
++            mcqs = extract_or_generate_mcqs(
++                text,
++                topic=file_topic if file_topic != "General" else selected.value,
++                min_questions=5,
++                allowed_topics=[file_topic] if file_topic != "General" else None,
+             )
+-            warnings.append(filename)
+-            continue
++            for mcq in mcqs:
++                if file_topic != "General":
++                    mcq["topic"] = file_topic
++                all_preview_questions.append(mcq)
++
++            # Automatically persist all extracted MCQs into Master Question Bank in DB
++            questions_extracted = _store_mcqs_in_db(db, mcqs, selected.value, mcq_batch_id, source_type=file_type)
+ 
+-        chunks = chunk_text(text)
+-        if not chunks:
+-            logger.warning(
+-                "File '%s': text too short to produce chunks (%d chars) → added to warnings",
++            logger.info(
++                "File '%s' (topic '%s'): processed %d MCQs for %s",
+                 filename,
+-                len(text.strip()),
++                file_topic,
++                questions_extracted,
++                selected.value,
+             )
+-            warnings.append(filename)
+-            continue
+ 
+-        # REQ-5.1 / REQ-8.5: mutate only the selected subject's index.
+-        logger.info(
+-            "File '%s': successfully extracted %d chars → %d chunks → indexing into %s",
+-            filename,
+-            len(text.strip()),
+-            len(chunks),
+-            selected.value,
+-        )
+-        try:
+-            stores.add(selected, chunks)
+-        except Exception as exc:
+-            logger.warning("FAISS store indexing failed for %s: %s", filename, exc)
+-
+-        # Record in database
+-        _record_indexed_file(
+-            db,
+-            subject=selected.value,
+-            filename=filename,
+-            file_hash=file_hash,
+-            file_size=file_size,
+-            chunk_count=len(chunks),
+-            file_type=file_type,
+-        )
++            indexed_files += 1
++            total_chunks += len(chunks)
++            total_questions_extracted += questions_extracted
+ 
+-        # Persist file copy to data/textbooks
+-        try:
+-            from pathlib import Path
+-            save_dir = Path("data/textbooks")
+-            save_dir.mkdir(parents=True, exist_ok=True)
+-            (save_dir / filename).write_bytes(content)
+         except Exception as exc:
+-            logger.warning("Could not persist file copy to data/textbooks: %s", exc)
+-
+-        # Extract MCQs strictly scoped to this file's chapter topic
+-        file_topic = match_filename_to_topic(filename, selected.value)
+-        mcq_batch_id = uuid.uuid4()
+-        mcqs = extract_or_generate_mcqs(
+-            text,
+-            topic=file_topic if file_topic != "General" else selected.value,
+-            min_questions=5,
+-            allowed_topics=[file_topic] if file_topic != "General" else None,
+-        )
+-        for mcq in mcqs:
+-            if file_topic != "General":
+-                mcq["topic"] = file_topic
+-        questions_extracted = _store_mcqs_in_db(db, mcqs, selected.value, mcq_batch_id, source_type=file_type)
+-        logger.info(
+-            "File '%s' (topic '%s'): extracted %d MCQs into question bank for %s",
+-            filename,
+-            file_topic,
+-            questions_extracted,
+-            selected.value,
+-        )
+-
+-        indexed_files += 1
+-        total_chunks += len(chunks)
+-        total_questions_extracted += questions_extracted
++            logger.error("Error processing file '%s': %s", filename, exc, exc_info=True)
++            failed_files.append({"filename": filename, "reason": f"File extraction error: {str(exc)}"})
+ 
+     return {
+         "success": True,
+@@ -691,8 +694,10 @@ def upload(subject: Optional[str] = None, file_type: str = "question_paper", fil
+         "indexed_files": indexed_files,
+         "total_chunks": total_chunks,
+         "questions_extracted": total_questions_extracted,
+-        "warnings": warnings,
++        "preview_questions": all_preview_questions,
+         "already_indexed": already_indexed,
++        "failed_files": failed_files,
++        "warnings": warnings,
+     }
+ 
+ 
