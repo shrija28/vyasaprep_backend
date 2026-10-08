@@ -75,7 +75,9 @@ router = Blueprint("admin_upload", __name__)
 
 # REQ-5.3 — matches the legacy ``/upload`` cap so admins don't experience
 # a regression when migrating to the role-scoped endpoint.
-MAX_FILES_PER_BATCH = 10
+MAX_FILES_PER_BATCH = 100
+MAX_FILE_SIZE_MB = 100
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 
 def _validation_error(message: str, field: Optional[str] = None):
@@ -700,29 +702,18 @@ def upload(subject: Optional[str] = None, file_type: str = "question_paper", fil
             "already_indexed": already_indexed,
         }
 
-    # Clear previously indexed files for this subject so only this uploaded batch defines the active scope
-    try:
-        old_files = db.execute(
-            select(IndexedFile).where(
-                IndexedFile.subject == selected.value,
-                IndexedFile.institution_id.is_(None),
-            )
-        ).scalars().all()
-        for of in old_files:
-            db.delete(of)
-        db.commit()
-    except Exception as e:
-        logger.warning("Could not clear previous indexed files: %s", e)
-
-    try:
-        stores.reset(selected)
-    except Exception as exc:
-        logger.warning("Failed to reset store for %s: %s", selected.value, exc)
-
     for upload_file in files:
         filename = upload_file.filename or ""
         content = upload_file.read()
         file_size = len(content)
+        if file_size > MAX_FILE_SIZE_BYTES:
+            msg = (
+                f"File size ({file_size / (1024 * 1024):.1f} MB) "
+                f"exceeds maximum supported limit ({MAX_FILE_SIZE_MB} MB)"
+            )
+            logger.warning("File '%s': %s", filename, msg)
+            warnings.append(msg)
+            continue
         file_hash = _compute_file_hash(content)
 
         logger.info("Processing file: %s (%d bytes, hash: %s)", filename, file_size, file_hash[:12])
