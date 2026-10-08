@@ -21,14 +21,12 @@ GET    /content/analytics           – institution student analytics
 
 from __future__ import annotations
 import os
-import re
 
 import hashlib
 import logging
 import random
 import uuid
 from typing import Annotated, Any, List, Optional
-from fastapi import HTTPException
 from pydantic import BaseModel
 
 import os
@@ -44,13 +42,12 @@ from ..db.models import (
 from ..db.session import get_async_session as get_session
 from ..db.subscription_models import Institution, Subscription, SubscriptionPlan
 from ..middleware.rbac import require_authenticated
-from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question, shuffle_question_options
+from ..rag.mcq_extractor import extract_or_generate_mcqs
 
 # Graceful degradation for Python 3.14 compatibility
 # pytesseract is not available in Python 3.14 (pkgutil.find_loader removed)
 try:
     from ..rag.parsing import (
-        PDFOCRError,
         chunk_text,
         extract_text_from_docx,
         extract_text_from_pdf,
@@ -66,7 +63,6 @@ except ImportError as e:
     )
     PARSING_AVAILABLE = False
     # Provide stub functions so the module can still be imported
-    PDFOCRError = RuntimeError
     chunk_text = None
     extract_text_from_docx = None
     extract_text_from_pdf = None
@@ -83,6 +79,9 @@ MAX_FILE_SIZE_MB = 1000
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 MAX_FILES_PER_BATCH = 10
 PAGE_SIZE = 50
+SET_LABELS = ("A", "B", "C", "D")
+QUESTIONS_PER_EXAM = 240
+
 
 
 # ---------------------------------------------------------------------------
@@ -154,44 +153,17 @@ QUESTIONS_PER_EXAM = QUESTIONS_PER_SET * len(SET_LABELS)  # 240
 
 def require_institution_admin()-> dict:    
     payload = require_authenticated()
-    role = payload.get("role")
-    if role not in ("institution_admin", "platform_admin", "admin"):
+    
+    payload = require_authenticated()
+    if payload.get("role") != "institution_admin":
         raise HTTPException(
             status_code=403,
             detail={"error": "forbidden", "message": "Institution admin access required"},
         )
-    from flask import request, g
-    db = getattr(g, "db", None)
-
-    sub_claim = payload.get("sub")
-    if db and sub_claim:
-        from ..db.models import User
-        user_row = db.query(User).filter(User.email == sub_claim).first()
-        if not user_row:
-            user_row = db.query(User).filter(User.kcet_student_id == sub_claim).first()
-        if user_row and user_row.institution_id:
-            payload["institution_id"] = str(user_row.institution_id)
-
-    # Only platform admins can override institution_id via query/header
-    if role in ("platform_admin", "admin"):
-        req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
-        if req_inst and str(req_inst).strip().lower() != "all":
-            raw = str(req_inst).strip()
-            if db:
-                from ..db.subscription_models import Institution
-                from sqlalchemy import func
-                inst = db.query(Institution).filter(func.lower(Institution.name) == raw.lower()).first()
-                if inst:
-                    payload["institution_id"] = str(inst.id)
-                else:
-                    payload["institution_id"] = raw
-            else:
-                payload["institution_id"] = raw
-
-    if not payload.get("institution_id") or payload.get("institution_id") == "None":
+    if "institution_id" not in payload:
         raise HTTPException(
             status_code=403,
-            detail={"error": "no_institution_linked", "message": "User is not linked to any institution"},
+            detail={"error": "forbidden", "message": "Institution ID not found in token"},
         )
     return payload
 
@@ -201,21 +173,7 @@ def require_institution_admin()-> dict:
 # ---------------------------------------------------------------------------
 
 def _institution_id(payload: dict)-> uuid.UUID:
-    raw = payload.get("institution_id") if payload else None
-    if raw and raw != "None":
-        try:
-            return uuid.UUID(str(raw))
-        except ValueError:
-            pass
-    from flask import request, g
-    db = getattr(g, "db", None)
-    req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
-    if req_inst and req_inst != "None":
-        try:
-            return uuid.UUID(str(req_inst))
-        except ValueError:
-            pass
-    raise HTTPException(status_code=403, detail={"error": "no_institution_linked", "message": "No valid institution ID provided"})
+    return uuid.UUID(payload["institution_id"])
 
 
 def check_subscription_active(db: Session, institution_id: uuid.UUID)-> bool:
@@ -223,11 +181,11 @@ def check_subscription_active(db: Session, institution_id: uuid.UUID)-> bool:
     return True
 
 
-def _validation_error(message: str, field: Optional[str] = None)-> Any:
+def _validation_error(message: str, field: Optional[str] = None)-> JSONResponse:
     body: dict[str, Any] = {"error": "validation_error", "message": message}
     if field is not None:
         body["field"] = field
-    return make_response(jsonify(body), 400)
+    return JSONResponse(status_code=400, content=body)
 
 
 def _normalise_subject(value: Optional[str])-> Optional[Subject]:
@@ -283,88 +241,24 @@ def _record_indexed_file(db: Session, subject: str, filename: str, file_hash: st
     return record
 
 
-def _normalise_mcq_answer(ans: Any) -> int:
-    if ans is None:
-        return 0
-    if isinstance(ans, str):
-        value = ans.strip().lower()
-        if value in ("a", "b", "c", "d"):
-            return {"a": 0, "b": 1, "c": 2, "d": 3}[value]
-        try:
-            idx = int(value)
-            if 0 <= idx <= 3:
-                return idx
-        except ValueError:
-            pass
-    try:
-        idx = int(ans)
-        if 0 <= idx <= 3:
-            return idx
-    except (TypeError, ValueError):
-        pass
-    return 0
-
-
-def _clean_question_options(opts: Any) -> List[str]:
-    if not isinstance(opts, list):
-        return []
-    cleaned: List[str] = []
-    for opt in opts[:4]:
-        if opt is None:
-            continue
-        value = str(opt).strip()
-        if not value:
-            continue
-        value = value.lstrip("([")
-        value = value.rstrip(")]")
-        value = value.replace("\u00a0", " ")
-        if re.match(r"^[A-Da-d][\.:)-]\s*", value):
-            value = re.sub(r"^[A-Da-d][\.:)-]\s*", "", value, count=1, flags=re.IGNORECASE)
-        if value:
-            cleaned.append(value.strip())
-    return cleaned[:4]
-
-
-def _prepare_valid_mcq(mcq: dict, subject: str, fallback_topic: Optional[str] = None) -> Optional[dict]:
-    q_text = str(mcq.get("q", "") or "").strip()
-    opts = _clean_question_options(mcq.get("opts", []))
-    if not q_text or len(opts) != 4:
-        return None
-    if not is_valid_question(q_text, opts, subject=subject):
-        return None
-
-    topic = str(mcq.get("topic") or fallback_topic or subject or "General").strip() or "General"
-    return {
-        "q": q_text,
-        "opts": opts,
-        "ans": _normalise_mcq_answer(mcq.get("ans", 0)),
-        "topic": topic,
-        "exp": str(mcq.get("exp", "") or "").strip(),
-    }
-
-
 def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uuid.UUID, institution_id: uuid.UUID)-> int:
     stored = 0
-    seen_questions = set()
     for mcq in mcqs:
-        valid = _prepare_valid_mcq(mcq, subject, fallback_topic=subject)
-        if valid is None:
+        q_text = mcq.get("q", "").strip()
+        opts = mcq.get("opts", [])
+        ans = mcq.get("ans", 0)
+        topic = mcq.get("topic", "General")
+        if not q_text or not isinstance(opts, list) or len(opts) != 4:
             continue
-        fingerprint = valid["q"].lower().strip()
-        if fingerprint in seen_questions:
-            continue
-        seen_questions.add(fingerprint)
-
-        shuffled_opts, new_ans = shuffle_question_options(valid["opts"], valid["ans"])
         row = Question(
             subject=subject,
-            question_text=valid["q"],
-            options=shuffled_opts,
-            correct_option=str(new_ans),
-            topic=valid["topic"],
+            question_text=q_text,
+            options=opts,
+            correct_option=str(ans),
+            topic=topic if isinstance(topic, str) else "General",
             generation_batch_id=batch_id,
             institution_id=institution_id,
-            explanation=valid["exp"],
+            explanation=mcq.get("exp", ""),
         )
         db.add(row)
         stored += 1
@@ -372,43 +266,21 @@ def _store_mcqs_in_db(db: Session, mcqs: List[dict], subject: str, batch_id: uui
         try:
             db.commit()
         except Exception as exc:
-            logger.warning("Failed to commit institution MCQs: %s", exc)
+            logger.warning("Failed to commit MCQs: %s", exc)
             db.rollback()
             return 0
     return stored
 
 
 def _serialise_question(row: Question)-> dict[str, Any]:
-    opts = row.options
-    if isinstance(opts, str):
-        try:
-            import json
-            opts = json.loads(opts)
-        except Exception:
-            opts = []
-    if not isinstance(opts, list):
-        opts = []
-
-    ans_str = str(row.correct_option if row.correct_option is not None else "0").strip()
-    ans_val = int(ans_str) if ans_str.isdigit() else ans_str
-
     return {
         "id": str(row.id),
         "subject": row.subject,
-        "question": row.question_text,
         "question_text": row.question_text,
-        "q": row.question_text,
-        "options": opts,
-        "opts": opts,
-        "correct_option": str(row.correct_option),
-        "ans": ans_val,
-        "topic": row.topic or "General",
-        "explanation": row.explanation or "",
-        "exp": row.explanation or "",
-        "source_type": row.source_type,
-        "generation_batch_id": str(row.generation_batch_id),
-        "type": "MCQ",
-        "marks": 1,
+        "options": row.options,
+        "correct_option": row.correct_option,
+        "topic": row.topic,
+        "explanation": row.explanation,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
@@ -416,7 +288,7 @@ def _serialise_question(row: Question)-> dict[str, Any]:
 def _counts_by_subject(session: Session, institution_id: uuid.UUID)-> dict[str, int]:
     rows = session.execute(
         select(Question.subject, func.count(Question.id))
-        .where(Question.institution_id == institution_id)
+        .where(Question.institution_id.is_(None))
         .group_by(Question.subject)
     ).all()
     found = {s: int(c) for s, c in rows}
@@ -430,29 +302,10 @@ def _counts_by_subject(session: Session, institution_id: uuid.UUID)-> dict[str, 
 @router.route("/content/upload/single", methods=["POST"])
 def upload_single_file(subject: Optional[str] = None, file_type: str = "question_paper", file: Any = None)-> Any:    
     payload = require_institution_admin()
-    from flask import g, request
-    db = getattr(g, "db", None)
-    session = db
-    """Upload a single file and return per-file status for progress tracking."""
-    inst_id = _institution_id(payload)
-
-    if subject is None:
-        subject = request.form.get("subject") or request.args.get("subject")
-    if file_type is None or file_type == "question_paper":
-        file_type = request.form.get("file_type") or request.args.get("file_type") or "question_paper"
-    if file is None:
-        file = request.files.get("file")
-    if file is None:
-        return _validation_error("file is required", field="file")
-
-    if not check_subscription_active(db, inst_id):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "subscription_inactive",
-                "message": "Institution subscription must be active to upload content.",
-            },
-        )
+    return make_response(jsonify({
+        "error": "forbidden",
+        "message": "Institution admins cannot upload questions directly. All questions are managed centrally in the Master Question Bank by Platform Admins."
+    }), 403)
 
     selected = _normalise_subject(subject)
     if selected is None:
@@ -485,10 +338,7 @@ def upload_single_file(subject: Optional[str] = None, file_type: str = "question
             "message": f"Already indexed as '{existing.filename}' with {existing.chunk_count} chunks",
         }
 
-    try:
-        text = _extract_text(filename, content)
-    except PDFOCRError as exc:
-        return make_response(jsonify({"error": "ocr_failed", "message": str(exc)}), 502)
+    text = _extract_text(filename, content)
     if text is None:
         return {
             "status": "unsupported",
@@ -557,30 +407,10 @@ def upload_single_file(subject: Optional[str] = None, file_type: str = "question
 @router.route("/content/upload", methods=["POST"])
 def upload_institution_content(subject: Optional[str] = None, file_type: str = "question_paper", files: Optional[List[Any]] = None)-> Any:    
     payload = require_institution_admin()
-    from flask import g, request
-    db = getattr(g, "db", None)
-    session = db
-    """Batch upload question papers to the institution's question bank."""
-    inst_id = _institution_id(payload)
-
-    if subject is None:
-        subject = request.form.get("subject") or request.args.get("subject")
-    if file_type is None or file_type == "question_paper":
-        file_type = request.form.get("file_type") or request.args.get("file_type") or "question_paper"
-    if not files:
-        files = request.files.getlist("files") or request.files.getlist("file")
-
-    if not files:
-        return _validation_error("At least one file is required", field="files")
-
-    if not check_subscription_active(db, inst_id):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "subscription_inactive",
-                "message": "Institution subscription must be active to upload content.",
-            },
-        )
+    return make_response(jsonify({
+        "error": "forbidden",
+        "message": "Institution admins cannot upload questions directly. All questions are managed centrally in the Master Question Bank by Platform Admins."
+    }), 403)
 
     selected = _normalise_subject(subject)
     if selected is None:
@@ -622,11 +452,7 @@ def upload_institution_content(subject: Optional[str] = None, file_type: str = "
             })
             continue
 
-        try:
-            text = _extract_text(filename, content)
-        except PDFOCRError as exc:
-            warnings.append(f"{filename}: {exc}")
-            continue
+        text = _extract_text(filename, content)
         if text is None:
             warnings.append(f"{filename}: unsupported file type (only PDF, DOCX, TXT allowed)")
             continue
@@ -654,11 +480,7 @@ def upload_institution_content(subject: Optional[str] = None, file_type: str = "
         )
 
         mcq_batch_id = uuid.uuid4()
-        mcqs = extract_or_generate_mcqs(
-            text,
-            topic=selected.value,
-            min_questions=5,
-        )
+        mcqs = extract_or_generate_mcqs(text, topic=selected.value, min_questions=5)
         questions_extracted = _store_mcqs_in_db(
             db, mcqs, selected.value, mcq_batch_id, inst_id
         )
@@ -698,30 +520,26 @@ def list_institution_indexed_files()-> Any:
     """Return files previously indexed by this institution for a subject."""
     inst_id = _institution_id(payload)
 
-    selected: Optional[Subject] = None
-    if subject is not None and str(subject).strip() != "" and str(subject).strip().lower() not in ("all", "any", "null", "undefined"):
-        normalised = _normalise_subject(subject)
-        if normalised is None:
-            return _validation_error(
-                f"subject must be one of {[s.value for s in Subject]}",
-                field="subject",
-            )
-        selected = normalised
-
-    conditions = [IndexedFile.institution_id == inst_id]
-    if selected is not None:
-        conditions.append(IndexedFile.subject == selected.value)
+    selected = _normalise_subject(subject)
+    if selected is None:
+        return _validation_error(
+            f"subject must be one of {[s.value for s in Subject]}",
+            field="subject",
+        )
 
     stmt = (
         select(IndexedFile)
-        .where(*conditions)
+        .where(
+            IndexedFile.subject == selected.value,
+            IndexedFile.institution_id == inst_id,
+        )
         .order_by(IndexedFile.indexed_at.desc())
     )
     files = db.execute(stmt).scalars().all()
 
     return {
         "institution_id": str(inst_id),
-        "subject": selected.value if selected else None,
+        "subject": selected.value,
         "files": [
             {
                 "id": str(f.id),
@@ -765,30 +583,33 @@ def get_question_counts()-> Any:
 @router.route("/content/questions", methods=["GET"])
 def list_institution_questions()-> Any:    
     payload = require_institution_admin()
-    from flask import g, request
-    session = getattr(g, "db", None)
+    from flask import g
+    db = getattr(g, "db", None)
+    session = db
+    from flask import request
     subject = request.args.get("subject", None)
+    from flask import request
+    page = int(request.args.get("page", 1))
+    
+    payload = require_institution_admin()
+    from flask import g
+    db = getattr(g, "db", None)
+    session = db
+    from flask import request
+    subject = request.args.get("subject", None)
+    from flask import request
     page = int(request.args.get("page", 1))
     """Paginated list of questions in this institution's bank."""
     inst_id = _institution_id(payload)
-    batch_id_arg = request.args.get("batch_id")
 
-    base_filter = [Question.institution_id == inst_id]
-    if batch_id_arg and batch_id_arg.strip():
-        try:
-            b_uuid = uuid.UUID(batch_id_arg.strip())
-            base_filter.append(Question.generation_batch_id == b_uuid)
-        except ValueError:
-            pass
-    selected: Optional[Subject] = None
-    if subject is not None and str(subject).strip() != "" and str(subject).strip().lower() not in ("all", "any", "null", "undefined"):
-        normalised = _normalise_subject(subject)
-        if normalised is None:
+    base_filter = [Question.institution_id.is_(None)]
+    selected = _normalise_subject(subject)
+    if subject is not None:
+        if selected is None:
             return _validation_error(
                 f"subject must be one of {[s.value for s in Subject]}",
                 field="subject",
             )
-        selected = normalised
         base_filter.append(Question.subject == selected.value)
 
     total = int(session.execute(
@@ -821,30 +642,11 @@ def list_institution_questions()-> Any:
 @router.route("/content/questions/<question_id>", methods=["DELETE"])
 def delete_institution_question(question_id: uuid.UUID)-> Any:    
     payload = require_institution_admin()
-    from flask import g
-    db = getattr(g, "db", None)
-    session = db
-    """Delete a question from this institution's bank."""
-    inst_id = _institution_id(payload)
-    qid_str = str(question_id)
-
-    try:
-        result = session.execute(
-            delete(Question).where(
-                Question.id == question_id,
-                Question.institution_id == inst_id,
-            )
-        )
-        rows_affected = int(result.rowcount or 0)
-        if rows_affected <= 0:
-            session.rollback()
-            return make_response(jsonify({"deleted": False, "error": "not_found", "id": qid_str}), 404)
-        session.commit()
-    except SQLAlchemyError as exc:
-        session.rollback()
-        logger.warning("DELETE /content/questions/%s failed: %s", qid_str, exc)
-        return make_response(jsonify({"deleted": False, "error": type(exc).__name__, "id": qid_str}), 500)
-    return {"deleted": True, "id": qid_str}
+    return make_response(jsonify({
+        "deleted": False,
+        "error": "forbidden",
+        "message": "Institution admins cannot delete questions from the Centralized Master Question Bank. Only Platform Admins have permission to manage Master Question Bank entries."
+    }), 403)
 
 
 # ---------------------------------------------------------------------------
@@ -878,7 +680,7 @@ def create_institution_exam()-> Any:
     scheduled_start_str = body.get("scheduled_start")
     scheduled_end_str = body.get("scheduled_end")
     is_published = body.get("is_published", True)
-    question_count = 60 # Strictly 60 questions per set per user requirement
+    question_count = int(body.get("question_count") or 60)
 
     selected = _normalise_subject(subject_raw)
     if selected is None:
@@ -911,116 +713,102 @@ def create_institution_exam()-> Any:
         except Exception:
             scheduled_end = None
 
-    # STRICT NO-REPEAT RULE: Query questions ALREADY used in previous exams for this subject & institution
-    from ..rag.mcq_extractor import normalize_question_fingerprint, apply_subject_subtype_breakdown, apply_kcet_chapter_distribution, interleave_by_subtype, infer_question_subtype, shuffle_question_options
+    # 1. Query available questions from Centralized Master Question Bank
+    from ..rag.mcq_extractor import is_valid_question
+    import json
 
-    used_q_rows = session.execute(
-        select(Question.id, Question.question_text)
-        .join(ExamSetQuestion, Question.id == ExamSetQuestion.question_id)
-        .join(ExamSet, ExamSetQuestion.exam_set_id == ExamSet.id)
-        .join(Exam, ExamSet.exam_id == Exam.id)
+    stmt = (
+        select(Question)
+        .where(Question.subject == selected.value, Question.institution_id.is_(None))
+        .order_by(Question.created_at.desc(), Question.id.desc())
+    )
+    rows = list(session.execute(stmt).scalars().all())
+
+    seen_texts: set[str] = set()
+    clean_questions: list[Question] = []
+    for r in rows:
+        if not r.question_text:
+            continue
+        norm_text = r.question_text.strip().lower()
+        if norm_text in seen_texts:
+            continue
+        opts = r.options
+        if isinstance(opts, str):
+            try:
+                opts = json.loads(opts)
+            except Exception:
+                opts = []
+        if not is_valid_question(r.question_text, opts, subject=selected.value):
+            continue
+        seen_texts.add(norm_text)
+        clean_questions.append(r)
+
+    # Prioritize questions not yet used in previous exams for this institution
+    linked_stmt = (
+        select(ExamSetQuestion.question_id)
+        .join(ExamSet, ExamSet.id == ExamSetQuestion.exam_set_id)
+        .join(Exam, Exam.id == ExamSet.exam_id)
         .where(Exam.subject == selected.value, Exam.institution_id == inst_id)
-    ).all()
-    used_qids = {r[0] for r in used_q_rows}
-    used_q_fingerprints = {normalize_question_fingerprint(r[1]) for r in used_q_rows if r[1]}
+    )
+    already_used_ids = set(session.execute(linked_stmt).scalars().all())
 
-    # ─────────────────────────────────────────────────────────────────
-    # STEP 1: Collect institution-owned unused questions
-    # ─────────────────────────────────────────────────────────────────
-    inst_query_filters = [
-        Question.subject == selected.value,
-        Question.institution_id == inst_id,
-    ]
-    if batch_id:
-        inst_query_filters.append(Question.generation_batch_id == batch_id)
+    available_questions = [q for q in clean_questions if q.id not in already_used_ids]
+    if len(available_questions) < question_count:
+        available_questions = clean_questions
 
-    inst_id_rows = session.execute(
-        select(Question.id, Question.question_text).where(*inst_query_filters)
-    ).all()
+    # If Master Bank has fewer questions than requested, top up the Master Bank
+    if len(available_questions) < question_count:
+        from ..rag.mcq_extractor import extract_or_generate_mcqs
+        needed = (question_count - len(available_questions)) + 15
+        used_texts = set(q.question_text for q in clean_questions if q.question_text)
+        topup_mcqs = extract_or_generate_mcqs(
+            "",
+            topic=selected.value,
+            min_questions=needed,
+            used_questions=used_texts,
+            allowed_topics=None,
+        )
+        for mcq in topup_mcqs:
+            q_text = mcq.get("q", "").strip()
+            if not q_text or q_text in used_texts:
+                continue
+            opts = mcq.get("opts", [])
+            if not is_valid_question(q_text, opts, subject=selected.value):
+                continue
+            row = Question(
+                subject=selected.value,
+                question_text=q_text,
+                options=opts,
+                correct_option=str(mcq.get("ans", 0)),
+                topic=mcq.get("topic", selected.value),
+                generation_batch_id=uuid.uuid4(),
+                institution_id=None,  # Master Question Bank
+                source_type="textbook",
+                explanation=mcq.get("exp", ""),
+            )
+            session.add(row)
+            available_questions.append(row)
+            used_texts.add(q_text)
+            if len(available_questions) >= question_count:
+                break
+        try:
+            session.flush()
+        except Exception:
+            session.rollback()
 
-    # Build institution unused pool with deduplication
-    inst_unused_ids = []
-    seen_fingerprints = set(used_q_fingerprints)
-    for qid, qtext in inst_id_rows:
-        fp = normalize_question_fingerprint(qtext)
-        if qid not in used_qids and fp and fp not in seen_fingerprints:
-            inst_unused_ids.append(qid)
-            seen_fingerprints.add(fp)
+    # 2. Draw questions strictly adhering to KCET 2026 blueprint engine
+    from ..rag.blueprint import allocate_blueprint_questions
 
-    # ─────────────────────────────────────────────────────────────────
-    # STEP 2: Collect platform-wide unused questions (fallback pool)
-    # NOTE: Do NOT apply batch_id filter to platform questions because
-    # platform and institution have no shared batch IDs.
-    # ─────────────────────────────────────────────────────────────────
-    platform_query_filters = [
-        Question.subject == selected.value,
-        Question.institution_id.is_(None),  # Platform-wide questions
-    ]
+    sampled_rows = allocate_blueprint_questions(
+        available_questions=available_questions,
+        subject=selected.value,
+        uploaded_topics=None,
+        total_questions=question_count,
+    )
+    base_qids = [q.id for q in sampled_rows]
 
-    platform_id_rows = session.execute(
-        select(Question.id, Question.question_text).where(*platform_query_filters)
-    ).all()
-
-    # Build platform unused pool, continuing to deduplicate with institution questions
-    platform_unused_ids = []
-    for qid, qtext in platform_id_rows:
-        fp = normalize_question_fingerprint(qtext)
-        if qid not in used_qids and fp and fp not in seen_fingerprints:
-            platform_unused_ids.append(qid)
-            seen_fingerprints.add(fp)
-
-    # ─────────────────────────────────────────────────────────────────
-    # STEP 3: Merge pools with priority: institution first, then platform
-    # ─────────────────────────────────────────────────────────────────
-    merged_unused_ids = inst_unused_ids + platform_unused_ids
-
+    # Partition across sets (Set A, B, C, D)
     num_sets = len(SET_LABELS)
-    target_per_set = 60 # Strictly 60 questions per set
-    total_needed = target_per_set
-
-    # Requirement: GENERATE QUESTIONS FROM QUESTION BANK + PLATFORM FALLBACK
-    # (no synthetic on-the-fly topup)
-    if len(merged_unused_ids) < total_needed:
-        available_count = len(merged_unused_ids)
-        return make_response(jsonify({
-            "error": "insufficient_questions",
-            "subject": selected.value,
-            "count": available_count,
-            "required": total_needed,
-            "message": f"Not enough eligible questions available for {selected.value}. {available_count} available, {total_needed} required."
-        }), 422)
-
-    # Restrict the candidate pool to 60 before balancing to preserve source priority.
-    unused_ids = merged_unused_ids[:total_needed]
-
-    # Load candidate Question objects
-    candidate_objects = session.execute(
-        select(Question).where(Question.id.in_(unused_ids))
-    ).scalars().all()
-
-    # Convert to dicts with subtype inference
-    candidate_dicts = [
-        {
-            "id": q.id,
-            "q": q.question_text,
-            "opts": q.options,
-            "subtype": infer_question_subtype(q.question_text, q.options or [], selected.value),
-            "topic": q.topic or "General"
-        }
-        for q in candidate_objects
-    ]
-
-    # Enforce KCET Blueprint Subtype Variety Breakdown (e.g. Physics: 35% Formula, 18% Multi-step, 47% Theory)
-    balanced_pool = apply_subject_subtype_breakdown(candidate_dicts, selected.value, target_per_set)
-    if len(balanced_pool) < target_per_set:
-        balanced_pool = candidate_dicts[:target_per_set]
-
-    # Interleave by subtype so adjacent questions alternate in structure
-    base_interleaved = interleave_by_subtype(balanced_pool)
-    base_qids = [item["id"] for item in base_interleaved]
-
-    # Standard KCET Model: All sets (Set A, B, C, D) contain the EXACT SAME pool of questions,
-    # but shuffled into different order sequences across sets so same question number contains different questions.
     partitions = []
     for s_i in range(num_sets):
         set_qids = list(base_qids)
@@ -1030,6 +818,7 @@ def create_institution_exam()-> Any:
                 set_qids.reverse()
         partitions.append(set_qids)
 
+    # 3. Create Exam record
     exam = Exam(
         subject=selected.value,
         exam_name=exam_name,
@@ -1103,15 +892,13 @@ def list_institution_exams()-> Any:
         .order_by(Exam.created_at.desc(), Exam.id.asc())
     )
 
-    selected: Optional[Subject] = None
-    if subject is not None and str(subject).strip() != "" and str(subject).strip().lower() not in ("all", "any", "null", "undefined"):
-        normalised = _normalise_subject(subject)
-        if normalised is None:
+    selected = _normalise_subject(subject)
+    if subject is not None:
+        if selected is None:
             return _validation_error(
                 f"subject must be one of {[s.value for s in Subject]}",
                 field="subject",
             )
-        selected = normalised
         stmt = stmt.where(Exam.subject == selected.value)
 
     rows = session.execute(stmt).all()
@@ -1440,14 +1227,7 @@ def get_admin_questions_for_institution()-> Any:
     """
     inst_id = _institution_id(payload)
 
-    # Feature gate — requires admin_question_bank flag in plan
-    _require_feature(
-        session, inst_id,
-        FEATURE_ADMIN_QBANK,
-        "Access to the admin KCET question bank",
-    )
-
-    base_filter = [Question.institution_id.is_(None)]  # platform-wide questions only
+    base_filter = [Question.institution_id.is_(None)]  # platform-wide Master Question Bank
     if subject:
         selected = _normalise_subject(subject)
         if selected is None:
