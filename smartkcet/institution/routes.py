@@ -17,10 +17,10 @@ from uuid import UUID
 import os
 from flask import Blueprint, request, g, make_response, jsonify, Response
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
 
-from fastapi import HTTPException
-from ..db.models import Exam, ExamSet, IndexedFile, Question, Submission, User
+from datetime import datetime, timedelta
+from werkzeug.exceptions import HTTPException
+from ..db.models import User, Exam
 from ..db.session import get_async_session as get_session
 from ..db.subscription_models import Institution, Subscription, SubscriptionPlan
 from ..middleware.rbac import require_authenticated
@@ -52,49 +52,35 @@ router = Blueprint("institution_routes", __name__)
 router.register_blueprint(content.router, tags=["institution-content"])
 
 
-def require_institution_admin()-> dict:
+def require_institution_admin()-> dict:    
     payload = require_authenticated()
-    role = payload.get("role")
-    if role not in ("institution_admin", "platform_admin", "admin"):
+    
+    payload = require_authenticated()
+    """Require institution_admin role and inject institution_id.
+    
+    Raises:
+        HTTPException: 403 if not an institution admin
+    """
+    if payload.get("role") != "institution_admin":
         raise HTTPException(
             status_code=403,
-            detail={"error": "forbidden", "message": "Institution admin access required"},
+            detail={
+                "error": "forbidden",
+                "message": "Institution admin access required",
+            },
         )
-    from flask import request, g
-    db = getattr(g, "db", None)
-
-    sub_claim = payload.get("sub")
-    if db and sub_claim:
-        from ..db.models import User
-        admin_user = db.query(User).filter(User.email == sub_claim).first()
-        if not admin_user:
-            admin_user = db.query(User).filter(User.kcet_student_id == sub_claim).first()
-        if admin_user and admin_user.institution_id:
-            payload["institution_id"] = str(admin_user.institution_id)
-
-    # Only platform admins can override institution_id via query/header
-    if role in ("platform_admin", "admin"):
-        req_inst = request.args.get("institution_id") or request.headers.get("X-Institution-ID")
-        if req_inst and str(req_inst).strip().lower() != "all":
-            raw = str(req_inst).strip()
-            if db:
-                from ..db.subscription_models import Institution
-                from sqlalchemy import func
-                inst = db.query(Institution).filter(func.lower(Institution.name) == raw.lower()).first()
-                if inst:
-                    payload["institution_id"] = str(inst.id)
-                else:
-                    payload["institution_id"] = raw
-            else:
-                payload["institution_id"] = raw
-
-    if not payload.get("institution_id") or payload.get("institution_id") == "None":
+    
+    # Ensure institution_id is present in payload
+    if "institution_id" not in payload:
         raise HTTPException(
             status_code=403,
-            detail={"error": "no_institution_linked", "message": "User is not linked to any institution"},
+            detail={
+                "error": "forbidden",
+                "message": "Institution ID not found in token",
+            },
         )
+    
     return payload
-
 
 
 @router.route(
@@ -241,13 +227,11 @@ def generate_invitation(data: Any = None):
 
 
 @router.route("/accept-invite", methods=["POST"])
-def accept_invitation():    
+def accept_invitation(data: InvitationAccept):    
     payload = require_authenticated()
-    from flask import g, request
+    from flask import g
     db = getattr(g, "db", None)
     session = db
-    raw_data = request.get_json() or {}
-    data = InvitationAccept(**raw_data)
     """Accept an institution invitation and link student to institution.
     
     **Requirements:** 9.2, 9.3, 9.4, 9.5
@@ -293,28 +277,7 @@ def accept_invitation():
     
     try:
         service.accept_invitation(data.code, student_id)
-        db.refresh(user)
-        inst_id_str = str(user.institution_id) if user.institution_id else None
-
-        from ..auth.tokens import issue_token
-        from ..auth.routes import _set_session_cookie, STUDENT_TOKEN_TTL_SEC
-
-        token, _jti, _iat, _exp = issue_token(
-            sub=user.kcet_student_id,
-            role="student",
-            student_subtype="institution_linked",
-            institution_id=inst_id_str,
-        )
-
-        resp = make_response(jsonify({
-            "success": True,
-            "message": "Successfully joined institution",
-            "institution_id": inst_id_str,
-            "student_subtype": "institution_linked",
-            "token": token,
-        }), 200)
-        _set_session_cookie(resp, token, max_age=STUDENT_TOKEN_TTL_SEC)
-        return resp
+        return None  # 204 No Content
     except InstitutionServiceError as e:
         error_msg = str(e)
         
@@ -422,7 +385,76 @@ def remove_student(student_id: UUID):
         )
 
 
-# GET /api/institution/students is implemented below in get_all_students() to provide a unified response
+@router.route("/students", methods=["GET"])
+def get_institution_students():    
+    payload = require_institution_admin()
+    from flask import g
+    db = getattr(g, "db", None)
+    session = db
+    """List all students linked to the institution.
+    
+    **Requirements:** 7.4, 9.1
+    
+    Returns a list of students linked to the authenticated institution admin's
+    institution, including their basic information and link date.
+    
+    Args:
+        payload: JWT payload from authentication middleware
+        db: Database session
+        
+    Returns:
+        InstitutionStudentsResponse with student list
+        
+    Raises:
+        HTTPException:
+            - 403: Not an institution admin
+            - 503: Database unavailable
+    """
+    service = InstitutionService(db)
+    institution_id = UUID(payload["institution_id"])
+    
+    try:
+        # Get institution details
+        institution = (
+            db.query(Institution)
+            .filter(Institution.id == institution_id)
+            .first()
+        )
+        
+        if not institution:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "institution_not_found",
+                    "message": f"Institution {institution_id} not found",
+                },
+            )
+        
+        # Get active subscription to determine max seats
+        active_subscription = (
+            db.query(Subscription)
+            .join(SubscriptionPlan, Subscription.plan_id == SubscriptionPlan.id)
+            .filter(
+                Subscription.institution_id == institution_id,
+                Subscription.status.in_(["trial", "active", "overdue", "grace_period"]),
+            )
+            .first()
+        )
+        
+        max_seats = None
+        if active_subscription and active_subscription.plan:
+            max_seats = active_subscription.plan.max_student_seats
+        
+        # Get students
+        students = service.get_institution_students(institution_id)
+        
+        return InstitutionStudentsResponse(
+            institution_id=institution_id,
+            institution_name=institution.name,
+            total_students=len(students),
+            max_seats=max_seats,
+            students=students,
+        )
         
     except InstitutionServiceError as e:
         raise HTTPException(
@@ -444,131 +476,56 @@ def remove_student(student_id: UUID):
 
 
 @router.route("/analytics", methods=["GET"])
-@router.route("/analytics/students", methods=["GET"])
 def get_institution_analytics():    
     payload = require_institution_admin()
     from flask import g
     db = getattr(g, "db", None)
-    """Get aggregated analytics for all students linked to the institution."""
+    session = db
+    """Get analytics for the institution's students.
+    
+    **Requirements:** 7.4, 9.6
+    
+    Returns aggregated analytics for all students linked to the institution,
+    including exam scores, completion rates, and per-student performance.
+    
+    Args:
+        payload: JWT payload from authentication middleware
+        db: Database session
+        
+    Returns:
+        Analytics data for the institution
+        
+    Raises:
+        HTTPException:
+            - 403: Not an institution admin
+            - 503: Database unavailable
+    """
+    institution_id = UUID(payload["institution_id"])
+    
+    # For MVP, return basic structure
+    # Full analytics implementation would be in a separate analytics service
     try:
-        institution_id = UUID(payload["institution_id"])
-        
-        student_users = db.query(User).filter(
-            User.institution_id == institution_id,
-            User.role == "student"
-        ).order_by(User.created_at.desc()).all()
-        
-        performances = [_compute_student_performance(db, st) for st in student_users]
-        
-        total_students = len(student_users)
-        active_students = sum(1 for p in performances if p["total_tests_taken"] > 0)
-        scores = [p["avg_score"] for p in performances if p["total_tests_taken"] > 0]
-        overall_avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
-        
-        total_passes = sum(p["pass_count"] for p in performances)
-        total_attempts = sum(p["total_tests_taken"] for p in performances)
-        overall_pass_rate = round((total_passes / total_attempts) * 100.0, 1) if total_attempts > 0 else 0.0
-
-        student_list_with_perf = []
-        for st, p in zip(student_users, performances):
-            student_list_with_perf.append({
-                "user_id": str(st.id),
-                "name": st.display_name or st.email,
-                "email": st.email,
-                "kcet_student_id": st.kcet_student_id or "—",
-                "batch_name": st.batch.name if getattr(st, "batch", None) else None,
-                "joined_at": st.created_at.isoformat() if st.created_at else None,
-                **p
-            })
-        
-        top_performers = sorted(
-            [s for s in student_list_with_perf if s["total_tests_taken"] > 0],
-            key=lambda x: x["avg_score"],
-            reverse=True
-        )[:5]
-        
-        needs_attention = [
-            s for s in student_list_with_perf
-            if s["total_tests_taken"] == 0 or s["avg_score"] < 50.0
-        ]
+        # Get student count
+        student_count = (
+            db.query(User)
+            .filter(User.institution_id == institution_id)
+            .count()
+        )
         
         return {
             "institution_id": str(institution_id),
-            "total_students": total_students,
-            "active_students": active_students,
-            "total_attempts": total_attempts,
-            "overall_avg_score": overall_avg_score,
-            "overall_pass_rate": overall_pass_rate,
-            "top_performers": top_performers,
-            "needs_attention": needs_attention,
-            "student_performance": student_list_with_perf,
+            "total_students": student_count,
+            "message": "Full analytics implementation pending",
         }
         
-    except HTTPException:
-        raise
     except Exception as e:
-        import logging
-        logging.getLogger("smartkcet.institution").error("Analytics error: %s", str(e), exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail={"error": "internal_error", "message": "Unable to calculate student analytics"}
+            detail={
+                "error": "internal_error",
+                "message": str(e),
+            },
         )
-
-
-@router.route("/students/<student_id>/performance", methods=["GET"])
-def get_student_detail_performance(student_id: str):
-    payload = require_institution_admin()
-    from flask import g
-    db = getattr(g, "db", None)
-    inst_id = UUID(payload["institution_id"])
-    
-    try:
-        s_uuid = UUID(student_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail={"error": "invalid_student_id"})
-
-    student = db.query(User).filter(User.id == s_uuid, User.institution_id == inst_id).first()
-    if not student:
-        raise HTTPException(status_code=404, detail={"error": "student_not_found"})
-
-    perf = _compute_student_performance(db, student)
-    
-    from ..db.models import Submission, ExamSet, Exam
-    subs = (
-        db.query(Submission, ExamSet, Exam)
-        .join(ExamSet, ExamSet.id == Submission.exam_set_id)
-        .join(Exam, Exam.id == ExamSet.exam_id)
-        .filter(Submission.user_id == student.id)
-        .order_by(desc(Submission.submitted_at))
-        .all()
-    )
-    
-    history = [
-        {
-            "submission_id": str(s.id),
-            "exam_name": ex.exam_name,
-            "subject": ex.subject,
-            "set_label": es.set_label,
-            "score_pct": float(s.score_pct) if s.score_pct is not None else 0.0,
-            "time_taken_sec": s.time_taken_sec,
-            "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
-            "status": "PASS" if (s.score_pct and float(s.score_pct) >= 50.0) else "FAIL",
-        }
-        for s, es, ex in subs
-    ]
-
-    return {
-        "student": {
-            "user_id": str(student.id),
-            "name": student.display_name or student.email,
-            "email": student.email,
-            "kcet_student_id": student.kcet_student_id or "—",
-            "joined_at": student.created_at.isoformat() if student.created_at else None,
-            "batch_name": student.batch.name if getattr(student, "batch", None) else None,
-        },
-        "performance": perf,
-        "submission_history": history,
-    }
 
 
 @router.route(
@@ -649,83 +606,6 @@ def select_subscription_plan(data: InstitutionPlanSelect):
         )
 
 
-def _compute_student_performance(db: Any, student_user: Any)-> dict[str, Any]:
-    """Helper to compute aggregated performance metrics for a single student."""
-    from ..db.models import Submission, ExamSet, Exam
-    from sqlalchemy import desc
-    from datetime import datetime
-    
-    if not student_user:
-        return {
-            "total_tests_taken": 0,
-            "avg_score": 0.0,
-            "highest_score": 0.0,
-            "pass_count": 0,
-            "pass_rate_pct": 0.0,
-            "last_active": None,
-            "status": "Enrolled",
-            "subject_scores": {},
-        }
-        
-    subs = (
-        db.query(Submission)
-        .filter(Submission.user_id == student_user.id)
-        .order_by(desc(Submission.submitted_at))
-        .all()
-    )
-    total_tests = len(subs)
-    if total_tests == 0:
-        return {
-            "total_tests_taken": 0,
-            "avg_score": 0.0,
-            "highest_score": 0.0,
-            "pass_count": 0,
-            "pass_rate_pct": 0.0,
-            "last_active": student_user.created_at.isoformat() if student_user.created_at else None,
-            "status": "Enrolled",
-            "subject_scores": {},
-        }
-
-    scores = [float(s.score_pct) for s in subs if s.score_pct is not None]
-    avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
-    highest_score = round(max(scores), 1) if scores else 0.0
-    pass_count = sum(1 for s in scores if s >= 50.0)
-    pass_rate_pct = round((pass_count / len(scores)) * 100.0, 1) if scores else 0.0
-    
-    last_sub_date = subs[0].submitted_at if subs[0].submitted_at else student_user.created_at
-    last_active_str = last_sub_date.isoformat() if last_sub_date else None
-
-    # Subject breakdown
-    subject_map = {}
-    for s in subs:
-        if s.score_pct is None:
-            continue
-        es = db.query(ExamSet).filter(ExamSet.id == s.exam_set_id).first()
-        ex = db.query(Exam).filter(Exam.id == es.exam_id).first() if es else None
-        sub_name = ex.subject if (ex and ex.subject) else "General"
-        if sub_name not in subject_map:
-            subject_map[sub_name] = []
-        subject_map[sub_name].append(float(s.score_pct))
-
-    subject_scores = {
-        sub: round(sum(vals) / len(vals), 1)
-        for sub, vals in subject_map.items() if vals
-    }
-
-    is_active = (datetime.utcnow() - last_sub_date).days <= 30 if last_sub_date else False
-
-    return {
-        "total_tests_taken": total_tests,
-        "avg_score": avg_score,
-        "highest_score": highest_score,
-        "pass_count": pass_count,
-        "pass_rate_pct": pass_rate_pct,
-        "last_active": last_active_str,
-        "status": "Active" if is_active else "Enrolled",
-        "subject_scores": subject_scores,
-    }
-
-
 @router.route("/dashboard", methods=["GET"])
 def get_institution_dashboard():    
     payload = require_institution_admin()
@@ -748,13 +628,11 @@ def get_institution_dashboard():
                 detail={"error": "institution_not_found", "message": "Institution not found"}
             )
 
-        # Student users (exclude institution_admin accounts)
-        student_users = db.query(User).filter(
+        # Student count (exclude institution_admin accounts)
+        total_students = db.query(User).filter(
             User.institution_id == institution_id,
             User.role == "student",
-        ).order_by(desc(User.created_at)).all()
-
-        total_students = len(student_users)
+        ).count()
 
         # Active subscription
         active_sub = (
@@ -774,12 +652,17 @@ def get_institution_dashboard():
 
         if active_sub and active_sub.plan:
             max_students = active_sub.plan.max_student_seats
+            # Use max_test_attempts_per_period for both weekly and monthly limits
             weekly_test_limit = active_sub.plan.max_test_attempts_per_period
             monthly_test_limit = active_sub.plan.max_test_attempts_per_period
             next_renewal_date = active_sub.next_renewal_date.isoformat() if active_sub.next_renewal_date else None
 
-        # Get all user IDs linked to this institution
-        all_user_ids = [st.id for st in student_users]
+        # Get all user IDs linked to this institution (students and admins)
+        all_user_ids = [
+            row[0] for row in db.query(User.id).filter(
+                User.institution_id == institution_id
+            ).all()
+        ]
 
         recent_submissions = []
         tests_this_week = 0
@@ -822,7 +705,6 @@ def get_institution_dashboard():
 
                     recent_submissions.append({
                         "student_name": student.display_name if (student and student.display_name) else (student.email if student else "Student"),
-                        "student_id": student.kcet_student_id if student else "—",
                         "subject": subject_name,
                         "score": round(s.score_pct, 1) if s.score_pct is not None else None,
                         "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
@@ -852,69 +734,9 @@ def get_institution_dashboard():
         tests_this_week = test_attempts_week + exams_created_week
         tests_this_month = test_attempts_month + exams_created_month
 
-        total_questions = db.query(Question).filter(
-            Question.institution_id == institution_id
-        ).count()
-
-        from sqlalchemy import func
-        q_by_sub_rows = (
-            db.query(Question.subject, func.count(Question.id))
-            .filter(Question.institution_id == institution_id)
-            .group_by(Question.subject)
-            .all()
-        )
-        questions_by_subject = {row[0]: int(row[1]) for row in q_by_sub_rows}
-
-        total_exams = db.query(Exam).filter(
-            Exam.institution_id == institution_id
-        ).count()
-
-        total_files = db.query(IndexedFile).filter(
-            IndexedFile.institution_id == institution_id
-        ).count()
-
-        total_attempts = (
-            db.query(Submission)
-            .filter(Submission.user_id.in_(all_user_ids))
-            .count()
-            if all_user_ids else 0
-        )
-
-        # Compute student performance roster & analytics summary
-        students_performance = []
-        all_student_scores = []
-        for st in student_users:
-            perf = _compute_student_performance(db, st)
-            st_info = {
-                "user_id": str(st.id),
-                "email": st.email,
-                "display_name": st.display_name or st.email,
-                "kcet_student_id": st.kcet_student_id or "—",
-                "joined_at": st.created_at.isoformat() if st.created_at else None,
-                "batch_name": st.batch.name if getattr(st, "batch", None) else None,
-                **perf
-            }
-            students_performance.append(st_info)
-            if perf["total_tests_taken"] > 0:
-                all_student_scores.append(perf["avg_score"])
-
-        overall_avg_score = round(sum(all_student_scores) / len(all_student_scores), 1) if all_student_scores else 0.0
-
-        recent_students = [
-            {
-                "user_id": str(st.id),
-                "name": st.display_name or st.email,
-                "email": st.email,
-                "kcet_student_id": st.kcet_student_id or "—",
-                "joined_at": st.created_at.isoformat() if st.created_at else None,
-            }
-            for st in student_users[:5]
-        ]
-
         return {
             "institution_id": str(institution_id),
             "institution_name": institution.name,
-            "institution_code": institution.institution_code,
             "total_students": total_students,
             "max_students": max_students,
             "subscription_status": subscription_status,
@@ -923,28 +745,8 @@ def get_institution_dashboard():
             "monthly_test_limit": monthly_test_limit,
             "tests_this_week": tests_this_week,
             "tests_this_month": tests_this_month,
-            "total_questions": total_questions,
-            "questions_by_subject": questions_by_subject,
-            "total_exams": total_exams,
-            "total_files": total_files,
-            "total_attempts": total_attempts,
-            "overall_avg_score": overall_avg_score,
             "recent_submissions": recent_submissions,
-            "recent_students": recent_students,
-            "students_performance": students_performance,
         }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import logging
-        logging.getLogger("smartkcet.institution").error(
-            "Dashboard endpoint error: %s", str(e), exc_info=True
-        )
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "internal_error", "message": "Unable to load dashboard data"}
-        )
     
     except HTTPException:
         raise
@@ -1068,8 +870,7 @@ def get_invitation_details(code: str):
     from ..db.subscription_models import Invitation
     from datetime import datetime
 
-    from sqlalchemy import func
-    inv = db.query(Invitation).filter(func.lower(func.trim(Invitation.code)) == code.strip().lower()).first()
+    inv = db.query(Invitation).filter(Invitation.code == code).first()
     if not inv:
         raise HTTPException(
             status_code=400,
@@ -1128,38 +929,14 @@ def accept_invitation_by_code(code: str):
 
     try:
         service.accept_invitation(code, student_id)
-        db.refresh(user)
-        inst_id_str = str(user.institution_id) if user.institution_id else None
-
-        from ..db.subscription_models import Invitation
-        from sqlalchemy import func
-        inv = db.query(Invitation).filter(func.lower(func.trim(Invitation.code)) == code.strip().lower()).first()
         institution_name = "your institution"
+        from ..db.subscription_models import Invitation
+        inv = db.query(Invitation).filter(Invitation.code == code).first()
         if inv:
             inst = db.query(Institution).filter(Institution.id == inv.institution_id).first()
             if inst:
                 institution_name = inst.name
-
-        from ..auth.tokens import issue_token
-        from ..auth.routes import _set_session_cookie, STUDENT_TOKEN_TTL_SEC
-
-        token, _jti, _iat, _exp = issue_token(
-            sub=user.kcet_student_id,
-            role="student",
-            student_subtype=user.student_subtype or "institution_linked",
-            institution_id=inst_id_str,
-        )
-
-        resp = make_response(jsonify({
-            "success": True,
-            "message": f"Successfully joined {institution_name}",
-            "institution_name": institution_name,
-            "institution_id": inst_id_str,
-            "student_subtype": user.student_subtype or "institution_linked",
-            "token": token,
-        }), 200)
-        _set_session_cookie(resp, token, max_age=STUDENT_TOKEN_TTL_SEC)
-        return resp
+        return {"message": f"Successfully joined {institution_name}", "institution_name": institution_name}
     except InstitutionServiceError as e:
         error_msg = str(e)
         if "Invalid invitation" in error_msg or "expired" in error_msg:
@@ -1192,9 +969,8 @@ def revoke_invitation(code: str):
         
         logger.info(f"Revoking invitation: original={code}, decoded={decoded_code}")
         
-        from sqlalchemy import func
         inv = db.query(Invitation).filter(
-            func.lower(func.trim(Invitation.code)) == decoded_code.strip().lower(),
+            Invitation.code == decoded_code,
             Invitation.institution_id == institution_id,
         ).first()
 
@@ -1287,6 +1063,10 @@ def get_institution_student_profile():
         "student_subtype": user.student_subtype,
         "institution_id": str(user.institution_id) if user.institution_id else None,
         "institution_name": institution.name if institution else None,
+        "institution": {
+            "id": str(institution.id),
+            "name": institution.name,
+        } if institution else None,
         "access_status": access_status,
         "plan_name": plan_name,
         "next_renewal_date": next_renewal_date,
@@ -1305,39 +1085,49 @@ def get_institution_student_exams():
     Platform-wide exams (institution_id IS NULL) are NOT shown.
     Strict isolation: no cross-institution access.
     """
+    if payload.get("role") != "student" or payload.get("student_subtype") != "institution_linked":
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "forbidden", "message": "Institution students only"},
+        )
+
+    institution_id_str = payload.get("institution_id")
+    if not institution_id_str:
+        raise HTTPException(status_code=403, detail={"error": "no_institution", "message": "No institution linked"})
+
+    institution_id = UUID(institution_id_str)
+
+    from ..db.models import Exam, ExamSet, User, Submission
     from sqlalchemy import func, or_
-    from ..db.models import Exam, ExamSet
 
-    sub_claim = payload.get("sub", "")
-    user = None
-    if sub_claim:
+    student_id_str = payload.get("user_id") or payload.get("sub")
+    student = None
+    if student_id_str:
         try:
-            sub_uuid = UUID(sub_claim)
-            user = db.query(User).filter(or_(User.id == sub_uuid, User.kcet_student_id == sub_claim, User.email == sub_claim)).first()
+            student = db.query(User).filter(User.id == UUID(student_id_str)).first()
         except Exception:
-            user = db.query(User).filter(or_(User.kcet_student_id == sub_claim, User.email == sub_claim)).first()
+            student = None
 
-    institution_id = None
-    if user and user.institution_id:
-        institution_id = user.institution_id
-    elif payload.get("institution_id"):
-        try:
-            institution_id = UUID(payload.get("institution_id"))
-        except Exception:
-            institution_id = None
+    completed_set_ids = set()
+    if student:
+        completed_rows = (
+            db.query(Submission.exam_set_id)
+            .filter(Submission.user_id == student.id, Submission.status == "completed")
+            .all()
+        )
+        completed_set_ids = {r[0] for r in completed_rows}
 
-    if not institution_id:
-        return make_response(jsonify({"error": "no_institution", "message": "No institution linked"}), 403)
+    student_batch_id = getattr(student, "batch_id", None) if student else None
 
-    student_batch_id = getattr(user, "batch_id", None) if user else None
-
-    # Filter: ONLY exams belonging to this institution
+    # Filter: ONLY exams belonging to this institution, AND either assigned to student's batch OR all batches
     filters = [
         Exam.is_published.is_(True),
         Exam.institution_id == institution_id,
     ]
     if student_batch_id:
         filters.append(or_(Exam.batch_id.is_(None), Exam.batch_id == student_batch_id))
+    else:
+        filters.append(Exam.batch_id.is_(None))
 
     stmt = (
         db.query(Exam, func.count(ExamSet.id).label("set_count"))
@@ -1348,21 +1138,17 @@ def get_institution_student_exams():
         .all()
     )
 
-    exam_ids = [exam.id for exam, _ in stmt]
-    all_exam_sets: dict[UUID, list[ExamSet]] = {}
-    if exam_ids:
-        sets_rows = (
+    buckets: dict[str, list] = {}
+    for exam, set_count in stmt:
+        sets_list = (
             db.query(ExamSet)
-            .filter(ExamSet.exam_id.in_(exam_ids))
+            .filter(ExamSet.exam_id == exam.id)
             .order_by(ExamSet.set_label.asc())
             .all()
         )
-        for es in sets_rows:
-            all_exam_sets.setdefault(es.exam_id, []).append(es)
+        exam_set_ids = set(s.id for s in sets_list)
+        has_attempted = bool(exam_set_ids.intersection(completed_set_ids))
 
-    buckets: dict[str, list] = {}
-    for exam, set_count in stmt:
-        sets_list = all_exam_sets.get(exam.id, [])
         bucket = buckets.setdefault(exam.subject, [])
         bucket.append({
             "exam_id": str(exam.id),
@@ -1377,6 +1163,10 @@ def get_institution_student_exams():
             "scheduled_end": exam.scheduled_end.isoformat() if getattr(exam, "scheduled_end", None) else None,
             "total_marks": getattr(exam, "total_marks", 60) or 60,
             "sets": [{"exam_set_id": str(s.id), "set_label": s.set_label} for s in sets_list],
+            "has_attempted": has_attempted,
+            "is_attempted": has_attempted,
+            "attempted": has_attempted,
+            "status": "completed" if has_attempted else "available",
         })
 
     return {
@@ -1405,7 +1195,7 @@ def get_institution_student_leaderboard():
     sub_claim = payload.get("sub", "")
 
     # Get all students in this institution
-    students = db.query(User).filter(User.institution_id == institution_id, User.role == "student").all()
+    students = db.query(User).filter(User.institution_id == institution_id).all()
     student_map = {str(s.id): s for s in students}
     student_ids = list(student_map.keys())
 
@@ -1472,7 +1262,7 @@ def get_institution_student_performance():
         db.query(Submission, ExamSet, Exam)
         .join(ExamSet, ExamSet.id == Submission.exam_set_id)
         .join(Exam, Exam.id == ExamSet.exam_id)
-        .filter(Submission.user_id == user.id, Submission.status == "completed")
+        .filter(Submission.user_id == user.id)
         .order_by(Submission.submitted_at.desc())
         .limit(100)
         .all()
@@ -1495,61 +1285,12 @@ def get_institution_student_performance():
     avg_score = round(sum(s["score_pct"] for s in submissions) / total, 1) if total else 0
     pass_rate = round(sum(1 for s in submissions if s["pass_flag"]) / total * 100, 1) if total else 0
 
-    inst_name = None
-    cohort_rank = "—"
-    cohort_rank_num = None
-    if user.institution_id:
-        from ..db.subscription_models import Institution
-        institution = db.query(Institution).filter(Institution.id == user.institution_id).first()
-        inst_name = institution.name if institution else None
-
-        inst_students = db.query(User.id).filter(
-            User.institution_id == user.institution_id,
-            User.role == "student"
-        ).all()
-        inst_student_ids = [r[0] for r in inst_students]
-
-        if inst_student_ids:
-            from sqlalchemy import func as sa_func
-            rank_rows = (
-                db.query(
-                    Submission.user_id,
-                    sa_func.avg(Submission.score_pct).label("avg_sc")
-                )
-                .filter(Submission.user_id.in_(inst_student_ids), Submission.status == "completed")
-                .group_by(Submission.user_id)
-                .order_by(sa_func.avg(Submission.score_pct).desc())
-                .all()
-            )
-            for idx, r in enumerate(rank_rows, start=1):
-                if r.user_id == user.id:
-                    cohort_rank_num = idx
-                    cohort_rank = f"#{idx} in {inst_name or 'Institution'}"
-                    break
-            if cohort_rank == "—" and total > 0:
-                cohort_rank = f"#1 in {inst_name or 'Institution'}"
-
-    student_id_val = user.kcet_student_id or str(user.id)
-
     return {
-        "student": {
-            "student_id": student_id_val,
-            "kcet_student_id": student_id_val,
-            "display_name": user.display_name or user.email,
-            "email": user.email,
-            "institution_id": str(user.institution_id) if user.institution_id else None,
-            "institution_name": inst_name,
-            "cohort_rank": cohort_rank,
-            "cohort_rank_num": cohort_rank_num,
-        },
         "submissions": submissions,
         "summary": {
             "total_exams": total,
-            "exams_taken": total,
             "avg_score": avg_score,
             "pass_rate": pass_rate,
-            "cohort_rank": cohort_rank,
-            "cohort_rank_num": cohort_rank_num,
         },
     }
 
@@ -1591,13 +1332,7 @@ def get_all_students():
     }
     """
     try:
-        institution_id_raw = payload.get("institution_id")
-        if not institution_id_raw:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": "no_institution_id", "message": "No institution ID in session context"}
-            )
-        institution_id = UUID(str(institution_id_raw))
+        institution_id = UUID(auth.get("institution_id"))
         
         # Get institution info
         institution = (
@@ -1612,24 +1347,6 @@ def get_all_students():
                 detail={"error": "institution_not_found", "message": "Institution not found"}
             )
         
-        # Get active subscription to determine max seats
-        active_subscription = (
-            db.query(Subscription)
-            .join(SubscriptionPlan, Subscription.plan_id == SubscriptionPlan.id)
-            .filter(
-                Subscription.institution_id == institution_id,
-                Subscription.status.in_(["trial", "active", "overdue", "grace_period"]),
-            )
-            .first()
-        )
-        
-        max_seats = None
-        if active_subscription and active_subscription.plan:
-            max_seats = active_subscription.plan.max_student_seats
-
-        service = InstitutionService(db)
-        students_summary_list = service.get_institution_students(institution_id)
-        
         # Get institution-linked students
         institution_students = (
             db.query(User)
@@ -1637,63 +1354,49 @@ def get_all_students():
                 User.institution_id == institution_id,
                 User.role == "student"
             )
-            .order_by(User.created_at)
             .all()
         )
         
-        # Direct subscribers registered outside the institution are strictly excluded from the institution platform
-        direct_subscribers = []
-
-        students_formatted = []
-        for s in students_summary_list:
-            st_user = db.query(User).filter(User.id == s.user_id, User.institution_id == institution_id).first()
-            perf = _compute_student_performance(db, st_user) if st_user else {}
-            students_formatted.append({
-                "user_id": str(s.user_id),
-                "email": s.email,
-                "display_name": s.display_name,
-                "kcet_student_id": s.kcet_student_id,
-                "linked_at": s.linked_at.isoformat() if s.linked_at else None,
-                "student_subtype": s.student_subtype,
-                "batch_id": str(s.batch_id) if s.batch_id else None,
-                "batch_name": s.batch_name,
-                **perf
-            })
-
-        inst_students_formatted = []
-        for s in institution_students:
-            perf = _compute_student_performance(db, s)
-            inst_students_formatted.append({
-                "email": s.email,
-                "name": s.display_name or s.email,
-                "id": s.kcet_student_id,
-                "subtype": s.student_subtype,
-                "batch_name": s.batch.name if getattr(s, "batch", None) else None,
-                "joined_at": s.created_at.isoformat() if s.created_at else None,
-                **perf
-            })
-
+        # Get all direct subscribers (not linked to any institution)
+        direct_subscribers = (
+            db.query(User)
+            .filter(
+                User.student_subtype == "direct_subscriber",
+                User.institution_id.is_(None),
+                User.role == "student"
+            )
+            .all()
+        )
+        
         return {
-            "institution_id": str(institution_id),
-            "institution_name": institution.name,
-            "institution_code": institution.institution_code,
-            "total_students": len(institution_students),
-            "max_seats": max_seats,
-            "students": students_formatted,
             "institution": {
                 "name": institution.name,
                 "code": institution.institution_code,
-                "students": inst_students_formatted
+                "students": [
+                    {
+                        "email": s.email,
+                        "name": s.display_name,
+                        "id": s.kcet_student_id,
+                        "subtype": s.student_subtype
+                    }
+                    for s in institution_students
+                ]
             },
-            "direct_subscribers": []
+            "direct_subscribers": [
+                {
+                    "email": s.email,
+                    "name": s.display_name,
+                    "id": s.kcet_student_id,
+                    "subtype": s.student_subtype
+                }
+                for s in direct_subscribers
+            ]
         }
         
-    except HTTPException:
-        raise
     except Exception as e:
         import logging
         logging.getLogger("smartkcet.institution").error(
-            "Error fetching students: %s", e, exc_info=True
+            "Error fetching students: %s", e
         )
         raise HTTPException(
             status_code=500,
@@ -1835,18 +1538,6 @@ def assign_student_batch(student_id: str):
         "batch_name": batch_name,
         "message": "Student batch updated successfully"
     })
-
-
-@router.route("/questions", methods=["GET"])
-def get_institution_questions_alias():
-    from .content import list_institution_questions
-    return list_institution_questions()
-
-
-@router.route("/exams", methods=["GET"])
-def get_institution_exams_alias():
-    from .content import list_institution_exams
-    return list_institution_exams()
 
 
 __all__ = ["router"]

@@ -38,6 +38,7 @@ Endpoints
 """
 
 from __future__ import annotations
+import os
 
 import logging
 import random
@@ -45,20 +46,16 @@ import time
 import uuid
 from typing import Any, Optional
 
-from flask import Blueprint, request, g, make_response, jsonify
+import os
+from flask import Blueprint, request, g, make_response, jsonify, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select, delete
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from ..db.models import (
-    Exam,
-    ExamSet,
-    ExamSetQuestion,
-    Question,
-    Subject,
-    Submission,
-)
+from ..db.models import Exam, ExamSet, ExamSetQuestion, Question, Subject, Submission
+from ..db.session import get_async_session as get_session
 from ..middleware.rbac import require_admin
 
 logger = logging.getLogger("smartkcet.admin.exams")
@@ -127,16 +124,29 @@ class PublishExamRequest(BaseModel):
 # POST /api/admin/exams  (REQ-7.1, REQ-7.2, REQ-7.3 / design.md §4)
 # ---------------------------------------------------------------------------
 
+
 @router.route("/exams", methods=["POST"])
-def create_exam() -> Any:
+def create_exam()-> Any:
+    from flask import request
     payload = CreateExamRequest(**(request.get_json() or {}))
     _admin = require_admin()
+    from flask import g
     db = getattr(g, "db", None)
     session = db
+    """Create one exam (1 row + 4 sets + 80 set-question links) atomically.
 
-    inst_id = _get_effective_institution_id(_admin, session)
-    if inst_id and inst_id.lower() != "all":
-        payload.institution_id = inst_id
+    Supports two question sources:
+    - ``source='question_paper'``: draws from DB questions extracted from PYQ uploads
+    - ``source='textbook'``: generates fresh KCET-level MCQs live from textbook
+      chunks stored in the FAISS index via Groq LLM
+    - ``source=None``: draws from all questions in DB regardless of source
+
+    For 'textbook' source the flow is:
+    1. Pull all FAISS chunks for the subject (textbook content)
+    2. Call Groq 4 times (once per set A/B/C/D) with 20 questions each
+    3. Store the 80 generated questions in the DB as source_type='textbook'
+    4. Create the exam + sets + links pointing at the newly stored questions
+    """
 
     selected = _normalise_subject(payload.subject)
     if selected is None:
@@ -150,36 +160,7 @@ def create_exam() -> Any:
     return _create_exam_from_db(payload, selected, session, source_filter=None)
 
 
-def _get_effective_institution_id(payload: dict, session: Session) -> str:
-    from flask import request
-    sub = payload.get("sub") if isinstance(payload, dict) else None
-    role = payload.get("role") if isinstance(payload, dict) else None
-    
-    user_inst_id = payload.get("institution_id") if isinstance(payload, dict) else None
-    if session and sub and not user_inst_id:
-        from ..db.models import User
-        user_row = session.query(User).filter(User.email == sub).first()
-        if not user_row:
-            user_row = session.query(User).filter(User.kcet_student_id == sub).first()
-        if user_row and user_row.institution_id:
-            user_inst_id = str(user_row.institution_id)
-
-    # Institution users & institution admins are strictly locked to their institution_id
-    if role == "institution_admin" or (user_inst_id and role not in ("platform_admin", "admin")):
-        return str(user_inst_id)
-
-    # Platform admins can filter by query parameter or default to "all"
-    req_inst = request.args.get("institution_id")
-    if req_inst and str(req_inst).strip():
-        return str(req_inst).strip()
-
-    if user_inst_id:
-        return str(user_inst_id)
-
-    return "all"
-
-
-def _get_clean_unique_questions(session: Session, subject_val: str, source_filter: Optional[str] = None, institution_id: Optional[str] = None)-> list[Question]:
+def _get_clean_unique_questions(session: Session, subject_val: str, source_filter: Optional[str] = None)-> list[Question]:
     """Return all valid, complete, deduplicated Question rows for the given subject,
     ordered with most recently added/generated questions prioritized."""
     from ..rag.mcq_extractor import is_valid_question
@@ -190,20 +171,6 @@ def _get_clean_unique_questions(session: Session, subject_val: str, source_filte
         .where(Question.subject == subject_val)
         .order_by(Question.created_at.desc(), Question.id.desc())
     )
-
-    if institution_id and str(institution_id).strip().lower() != "all":
-        inst_str = str(institution_id).strip().lower()
-        if inst_str in ("null", "none", "platform"):
-            stmt = stmt.where(Question.institution_id.is_(None))
-        else:
-            try:
-                inst_uuid = uuid.UUID(str(institution_id).strip())
-            except ValueError:
-                from ..db.subscription_models import Institution
-                inst_obj = session.query(Institution).filter(func.lower(Institution.name) == inst_str).first()
-                inst_uuid = inst_obj.id if inst_obj else None
-            if inst_uuid:
-                stmt = stmt.where(Question.institution_id == inst_uuid)
     if source_filter and source_filter not in ("all", ""):
         try:
             if source_filter in ("textbook", "rag"):
@@ -250,69 +217,67 @@ def _get_clean_unique_questions(session: Session, subject_val: str, source_filte
 
 def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session: Session, source_filter: Optional[str] = None)-> Any:
     """Draw questions from the DB question bank and build a 1-set exam (Set A with 60 questions).
-    
+
     Guarantees clean, authentic questions and allows multiple 60-question exams to be created from
     the 240 questions generated in the Question Bank.
     """
     subject_val = selected.value
-    inst_id_filter = payload.institution_id
 
-    # Step 1: Query clean, unique questions stored in the Question Bank for this subject & institution
-    clean_questions = _get_clean_unique_questions(session, subject_val, source_filter, institution_id=inst_id_filter)
+    # Step 1: Query clean, unique questions stored in the Question Bank for this subject
+    clean_questions = _get_clean_unique_questions(session, subject_val, source_filter)
 
-    # Query questions already linked to previous exams for this subject & institution
+    # Prioritize questions not yet used in previous exams for this subject
     linked_stmt = (
         select(ExamSetQuestion.question_id)
         .join(ExamSet, ExamSet.id == ExamSetQuestion.exam_set_id)
         .join(Exam, Exam.id == ExamSet.exam_id)
         .where(Exam.subject == subject_val)
     )
-    if inst_id_filter and inst_id_filter.lower() != "all":
-        try:
-            i_uuid = uuid.UUID(inst_id_filter)
-            linked_stmt = linked_stmt.where(Exam.institution_id == i_uuid)
-        except ValueError:
-            pass
-
     already_used_ids = set(session.execute(linked_stmt).scalars().all())
 
-    from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question, normalize_question_fingerprint
-
-    already_used_fingerprints = {
-        normalize_question_fingerprint(q.question_text)
-        for q in clean_questions
-        if (q.id in already_used_ids and q.question_text)
-    }
-
-    # Exclude all questions already used in previous exams for this subject
-    available_questions = [
-        q for q in clean_questions
-        if q.id not in already_used_ids
-        and normalize_question_fingerprint(q.question_text) not in already_used_fingerprints
-    ]
-
-    # Guarantee at least QUESTIONS_PER_SET (60) FRESH, unrepeated questions across full syllabus
-    used_texts = set(already_used_fingerprints)
-    for q in clean_questions:
-        if q.question_text:
-            used_texts.add(q.question_text.strip())
-            used_texts.add(normalize_question_fingerprint(q.question_text))
-
-    topup_inst_uuid = None
-    if inst_id_filter and inst_id_filter.lower() != "all":
-        try:
-            topup_inst_uuid = uuid.UUID(inst_id_filter)
-        except ValueError:
-            pass
-
+    available_questions = [q for q in clean_questions if q.id not in already_used_ids]
     if len(available_questions) < QUESTIONS_PER_SET:
-        return make_response(jsonify({
-            "error": "insufficient_questions",
-            "subject": subject_val,
-            "count": len(available_questions),
-            "required": QUESTIONS_PER_SET,
-            "message": f"Not enough unused questions available in Question Bank for {subject_val} ({len(available_questions)} available, {QUESTIONS_PER_SET} required). Please upload more question papers first."
-        }), 422)
+        available_questions = clean_questions
+
+    # Guarantee at least 60 questions for the exam across full syllabus
+    if len(available_questions) < QUESTIONS_PER_SET:
+        from ..rag.mcq_extractor import extract_or_generate_mcqs, is_valid_question
+        needed = (QUESTIONS_PER_SET - len(available_questions)) + 20
+        used_texts = set(q.question_text for q in clean_questions if q.question_text)
+        topup_mcqs = extract_or_generate_mcqs(
+            "",
+            topic=subject_val,
+            min_questions=needed,
+            used_questions=used_texts,
+            allowed_topics=None,
+        )
+        for mcq in topup_mcqs:
+            q_text = mcq.get("q", "").strip()
+            if not q_text or q_text in used_texts:
+                continue
+            opts = mcq.get("opts", [])
+            if not is_valid_question(q_text, opts, subject=subject_val):
+                continue
+            row = Question(
+                subject=subject_val,
+                question_text=q_text,
+                options=opts,
+                correct_option=str(mcq.get("ans", 0)),
+                topic=mcq.get("topic", subject_val),
+                generation_batch_id=uuid.uuid4(),
+                institution_id=None,
+                source_type="textbook",
+                explanation=mcq.get("exp", ""),
+            )
+            session.add(row)
+            available_questions.append(row)
+            used_texts.add(q_text)
+            if len(available_questions) >= QUESTIONS_PER_SET:
+                break
+        try:
+            session.flush()
+        except Exception:
+            session.rollback()
 
     from ..rag.blueprint import allocate_blueprint_questions
 
@@ -325,15 +290,8 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
     )
     drawn: list[uuid.UUID] = [q.id for q in sampled_rows]
 
-    labels = list(SET_LABELS)
-    partitions: list[list[uuid.UUID]] = []
-    for s_i in range(len(labels)):
-        set_qids = list(drawn)
-        if s_i > 0:
-            random.shuffle(set_qids)
-            if set_qids == drawn and len(set_qids) > 1:
-                set_qids.reverse()
-        partitions.append(set_qids)
+    partitions: list[list[uuid.UUID]] = [drawn]
+    labels = ["A"]
 
     exam_inst_id = None
     if payload.institution_id:
@@ -397,7 +355,7 @@ def _create_exam_from_db(payload: CreateExamRequest, selected: Subject, session:
 def _create_exam_from_textbook(payload: CreateExamRequest, selected: Subject, session: Session) -> Any:
     """Generate 80 KCET-level MCQs using RAG (Retrieval-Augmented Generation) from
     textbook chapters and syllabus content.
-    
+
     1. Checks uploaded chapter textbooks in data/textbooks/.
     2. If absent, loads pre-indexed textbook chunks from data/faiss/{subject}.chunks.json.
     3. Invokes Groq LLM to generate fresh questions anchored to textbook context.
@@ -453,19 +411,21 @@ def _create_exam_from_textbook(payload: CreateExamRequest, selected: Subject, se
 
     # ── Step 2: Fall back to pre-indexed FAISS textbook chunks if no files uploaded
     if not chapter_texts:
-        try:
-            from ..rag.store import stores
-            all_chunks = stores._get(selected).chunks
-            if all_chunks and isinstance(all_chunks, list):
-                # Sample chunks across the textbook
-                sample_count = min(30, len(all_chunks))
-                step = max(1, len(all_chunks) // sample_count)
-                sampled = [all_chunks[i] for i in range(0, len(all_chunks), step)][:sample_count]
-                joined_text = "\n\n".join(sampled)
-                chapter_texts.append((f"{subject_name} NCERT Textbook", joined_text))
-                logger.info("Loaded %d textbook chunks from store for %s RAG exam", len(sampled), subject_name)
-        except Exception as exc:
-            logger.warning("Failed to load chunks from store for %s: %s", subject_name, exc)
+        chunk_file = FAISS_DIR / f"{subject_name}.chunks.json"
+        if chunk_file.exists():
+            try:
+                with open(chunk_file, "r", encoding="utf-8") as f:
+                    all_chunks = json.load(f)
+                if all_chunks and isinstance(all_chunks, list):
+                    # Sample chunks across the textbook
+                    sample_count = min(30, len(all_chunks))
+                    step = max(1, len(all_chunks) // sample_count)
+                    sampled = [all_chunks[i] for i in range(0, len(all_chunks), step)][:sample_count]
+                    joined_text = "\n\n".join(sampled)
+                    chapter_texts.append((f"{subject_name} NCERT Textbook", joined_text))
+                    logger.info("Loaded %d textbook chunks from %s for RAG exam", len(sampled), chunk_file.name)
+            except Exception as exc:
+                logger.warning("Failed to load pre-indexed chunks for %s: %s", subject_name, exc)
 
     # If still no textbook content, provide a friendly message
     if not chapter_texts:
@@ -619,15 +579,11 @@ def _create_exam_from_textbook(payload: CreateExamRequest, selected: Subject, se
     session.add(exam)
     try:
         session.flush()
-        base_60 = stored_ids[:QUESTIONS_PER_SET]
-        partitions: list[list[uuid.UUID]] = []
-        for s_i in range(len(SET_LABELS)):
-            set_qids = list(base_60)
-            if s_i > 0:
-                random.shuffle(set_qids)
-                if set_qids == base_60 and len(set_qids) > 1:
-                    set_qids.reverse()
-            partitions.append(set_qids)
+        drawn = stored_ids[:QUESTIONS_PER_EXAM]
+        partitions = [
+            drawn[i * QUESTIONS_PER_SET : (i + 1) * QUESTIONS_PER_SET]
+            for i in range(len(SET_LABELS))
+        ]
         sets_payload: list[dict[str, Any]] = []
         for label, qids in zip(SET_LABELS, partitions):
             exam_set = ExamSet(exam_id=exam.id, set_label=label)
@@ -672,8 +628,10 @@ def _create_exam_from_textbook(payload: CreateExamRequest, selected: Subject, se
 
 @router.route("/exams/<exam_id>", methods=["PATCH"])
 def patch_exam(exam_id: str) -> Any:
+    from flask import request
     payload = PublishExamRequest(**(request.get_json() or {}))
     _admin = require_admin()
+    from flask import g
     db = getattr(g, "db", None)
     session = db
     """Toggle publish/unpublish on an existing exam (idempotent)."""
@@ -710,9 +668,12 @@ def patch_exam(exam_id: str) -> Any:
 
     return make_response(jsonify({"exam_id": str(exam.id), "is_published": exam.is_published}), 200)
 
+
+@router.route("/exams/<exam_id>", methods=["DELETE"])
 def delete_exam(exam_id: str) -> Any:
     """Permanently delete an exam and its sets / submissions."""
     _admin = require_admin()
+    from flask import g
     db = getattr(g, "db", None)
     session = db
 
@@ -758,12 +719,20 @@ def delete_exam(exam_id: str) -> Any:
 
 
 @router.route("/exams", methods=["GET"])
-def list_exams() -> Any:
+def list_exams()-> Any:
     _admin = require_admin()
+    from flask import g
     db = getattr(g, "db", None)
     session = db
-    subject = request.args.get("subject")
-    inst_id = _get_effective_institution_id(_admin, session)
+    from flask import request
+    subject = request.args.get("subject", None)
+    """List all exams with subject, creation date, published status, set_count.
+
+    REQ-7.6: the admin panel shows every exam regardless of publish
+    status.  Optional ``?subject=Biology`` filter scopes the list to a
+    single subject.  Sort order is ``created_at DESC`` so the freshly
+    created exam appears at the top.
+    """
 
     selected: Optional[Subject] = None
     if subject is not None:
@@ -776,37 +745,22 @@ def list_exams() -> Any:
             )
         selected = normalised
 
-    from ..db.subscription_models import Institution
-
+    # Compute set_count via a left join + group_by so we get one row per
+    # exam even when an exam has zero sets (which should not happen post
+    # task 7.1, but the join is defensive).
     stmt = (
-        select(Exam, Institution.name.label("institution_name"), func.count(ExamSet.id).label("set_count"))
-        .outerjoin(Institution, Institution.id == Exam.institution_id)
+        select(Exam, func.count(ExamSet.id).label("set_count"))
         .outerjoin(ExamSet, ExamSet.exam_id == Exam.id)
-        .group_by(Exam.id, Institution.name)
+        .group_by(Exam.id)
         .order_by(Exam.created_at.desc(), Exam.id.asc())
     )
-
-    if inst_id and inst_id.lower() != "all":
-        inst_str = inst_id.lower()
-        if inst_str in ("null", "none", "platform"):
-            stmt = stmt.where(Exam.institution_id.is_(None))
-        else:
-            try:
-                inst_uuid = uuid.UUID(inst_id)
-            except ValueError:
-                inst_obj = session.query(Institution).filter(func.lower(Institution.name) == inst_str).first()
-                inst_uuid = inst_obj.id if inst_obj else None
-            if inst_uuid:
-                stmt = stmt.where(Exam.institution_id == inst_uuid)
-
     if selected is not None:
         stmt = stmt.where(Exam.subject == selected.value)
 
     rows = session.execute(stmt).all()
     exams_payload: list[dict[str, Any]] = []
-    for exam, inst_name, set_count in rows:
+    for exam, set_count in rows:
         created_at = exam.created_at
-        is_inst = exam.institution_id is not None
         exams_payload.append(
             {
                 "exam_id": str(exam.id),
@@ -815,9 +769,6 @@ def list_exams() -> Any:
                 "created_at": created_at.isoformat() if created_at is not None else None,
                 "is_published": bool(exam.is_published),
                 "set_count": int(set_count or 0),
-                "institution_id": str(exam.institution_id) if is_inst else None,
-                "institution_name": inst_name if is_inst else None,
-                "owner_type": "institution" if is_inst else "admin",
             }
         )
 
@@ -837,6 +788,7 @@ def list_exams() -> Any:
 def get_exam_details(exam_id: str) -> Any:
     """Return the exam with all sets (A/B/C/D) and their assigned questions."""
     _admin = require_admin()
+    from flask import g
     db = getattr(g, "db", None)
     session = db
 

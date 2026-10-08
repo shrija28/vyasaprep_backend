@@ -47,6 +47,7 @@ from typing import Any, Optional
 
 import os
 from flask import Blueprint, request, g, make_response, jsonify, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -74,13 +75,15 @@ INSUFFICIENT_THRESHOLD = 20
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _validation_error(message: str, field: Optional[str] = None):
+
+
+def _validation_error(message: str, field: Optional[str] = None)-> JSONResponse:
     """Return a 400 envelope identical in shape to other admin endpoints."""
 
     body: dict[str, Any] = {"error": "validation_error", "message": message}
     if field is not None:
         body["field"] = field
-    return jsonify(body), 400
+    return JSONResponse(status_code=400, content=body)
 
 
 def _normalise_subject(value: Optional[str])-> Optional[Subject]:
@@ -98,20 +101,7 @@ def _normalise_subject(value: Optional[str])-> Optional[Subject]:
 
 
 def _serialise_question(row: Question)-> dict[str, Any]:
-    """Map a :class:`Question` ORM row to the JSON shape expected by all frontend components."""
-
-    opts = row.options
-    if isinstance(opts, str):
-        try:
-            import json
-            opts = json.loads(opts)
-        except Exception:
-            opts = []
-    if not isinstance(opts, list):
-        opts = []
-
-    ans_str = str(row.correct_option if row.correct_option is not None else "0").strip()
-    ans_val = int(ans_str) if ans_str.isdigit() else ans_str
+    """Map a :class:`Question` ORM row to the admin-list JSON shape."""
 
     created_at = row.created_at
     return {
@@ -119,75 +109,29 @@ def _serialise_question(row: Question)-> dict[str, Any]:
         "subject": row.subject,
         "question": row.question_text,
         "question_text": row.question_text,
-        "q": row.question_text,
-        "options": opts,
-        "opts": opts,
-        "correct_option": str(row.correct_option),
-        "ans": ans_val,
-        "topic": row.topic or "General",
-        "explanation": row.explanation or "",
-        "exp": row.explanation or "",
+        "options": row.options,
+        "correct_option": row.correct_option,
+        "topic": row.topic,
+        "explanation": row.explanation,
         "source_type": row.source_type,
         "generation_batch_id": str(row.generation_batch_id),
-        "type": "MCQ",
-        "marks": 1,
+        # ISO-8601 with naive UTC timestamps (matches what the ORM stores).
         "created_at": created_at.isoformat() if created_at is not None else None,
     }
 
 
-def _get_effective_institution_id(payload: dict, session: Session) -> str:
-    from flask import request
-    sub = payload.get("sub") if isinstance(payload, dict) else None
-    role = payload.get("role") if isinstance(payload, dict) else None
-    
-    user_inst_id = payload.get("institution_id") if isinstance(payload, dict) else None
-    if session and sub and not user_inst_id:
-        user_row = session.query(Question.__class__).none() if False else None
-        from ..db.models import User
-        user_row = session.query(User).filter(User.email == sub).first()
-        if not user_row:
-            user_row = session.query(User).filter(User.kcet_student_id == sub).first()
-        if user_row and user_row.institution_id:
-            user_inst_id = str(user_row.institution_id)
+def _counts_by_subject(session: Session)-> dict[str, int]:
+    """Return a ``{subject_value: count}`` map for platform-wide (admin) questions only.
 
-    # Institution users & institution admins are strictly locked to their institution_id
-    if role == "institution_admin" or (user_inst_id and role not in ("platform_admin", "admin")):
-        return str(user_inst_id)
-
-    # Platform admins can filter by query parameter or default to "all"
-    req_inst = request.args.get("institution_id")
-    if req_inst and str(req_inst).strip():
-        return str(req_inst).strip()
-
-    if user_inst_id:
-        return str(user_inst_id)
-
-    return "all"
-
-
-def _counts_by_subject(session: Session, institution_id: Optional[str] = None)-> dict[str, int]:
-    """Return a ``{subject_value: count}`` map for questions.
-
-    Supports filtering by institution_id ('all', 'platform'/'null', or specific UUID).
-    Defaults to counting all questions if institution_id is None or 'all'.
+    Only counts questions with ``institution_id IS NULL`` so institution-uploaded
+    questions never appear in the admin question bank.
     """
 
-    stmt = select(Question.subject, func.count(Question.id))
-    if institution_id and str(institution_id).strip().lower() != "all":
-        inst_str = str(institution_id).strip().lower()
-        if inst_str in ("null", "none", "platform"):
-            stmt = stmt.where(Question.institution_id.is_(None))
-        else:
-            try:
-                inst_uuid = uuid.UUID(str(institution_id).strip())
-            except ValueError:
-                from ..db.subscription_models import Institution
-                inst_obj = session.query(Institution).filter(func.lower(Institution.name) == inst_str).first()
-                inst_uuid = inst_obj.id if inst_obj else None
-            if inst_uuid:
-                stmt = stmt.where(Question.institution_id == inst_uuid)
-
-    rows = session.execute(stmt.group_by(Question.subject)).all()
+    rows = session.execute(
+        select(Question.subject, func.count(Question.id))
+        .where(Question.institution_id.is_(None))
+        .group_by(Question.subject)
+    ).all()
     found = {subject: int(count) for subject, count in rows}
     return {s.value: int(found.get(s.value, 0)) for s in Subject}
 
@@ -200,8 +144,9 @@ def _counts_by_subject(session: Session, institution_id: Optional[str] = None)->
 
 
 @router.route("/questions/counts", methods=["GET"])
-def list_counts() -> Any:
+def list_counts()-> Any:    
     _admin = require_admin()
+    from flask import g
     db = getattr(g, "db", None)
     session = db
     """Return per-subject totals + ``insufficient`` flags + the threshold.
@@ -211,8 +156,7 @@ def list_counts() -> Any:
     uses this to decide whether to show the "fewer than 20" warning.
     """
 
-    inst_id = _get_effective_institution_id(_admin, session)
-    counts = _counts_by_subject(session, institution_id=inst_id)
+    counts = _counts_by_subject(session)
     insufficient = {
         subject_value: total < INSUFFICIENT_THRESHOLD
         for subject_value, total in counts.items()
@@ -230,22 +174,36 @@ def list_counts() -> Any:
 
 
 @router.route("/questions", methods=["GET"])
-def list_questions() -> Any:
+def list_questions()-> Any:    
     _admin = require_admin()
+    from flask import g, request
     db = getattr(g, "db", None)
     session = db
-    subject = request.args.get("subject")
-    source = request.args.get("source")
-    inst_id = _get_effective_institution_id(_admin, session)
+    subject = request.args.get("subject", None)
+    source = request.args.get("source", None)
     try:
         page = int(request.args.get("page", 1))
         if page < 1:
             page = 1
     except (ValueError, TypeError):
         page = 1
+    """List questions with optional subject filter and stable pagination.
+
+    Query parameters
+    ----------------
+    subject
+        Optional KCET subject (one of ``Biology``, ``Physics``,
+        ``Chemistry``, ``Mathematics``).
+    source
+        Optional source filter (e.g. ``textbook``, ``question_paper``, ``rag``).
+    page
+        1-indexed page number.
+    page_size
+        Max number of questions per page (capped at 50).
+    """
 
     selected: Optional[Subject] = None
-    if subject is not None and str(subject).strip() != "" and str(subject).strip().lower() not in ("all", "any", "null", "undefined"):
+    if subject is not None and subject != "":
         normalised = _normalise_subject(subject)
         if normalised is None:
             allowed = [s.value for s in Subject]
@@ -265,33 +223,11 @@ def list_questions() -> Any:
         except ValueError:
             pass
 
-    batch_id_arg = request.args.get("batch_id")
-    # Build the base SELECT — default to all extracted questions (unless specific institution_id filter is requested).
-    base_filter = []
-    if inst_id and str(inst_id).strip().lower() != "all":
-        inst_str = str(inst_id).strip().lower()
-        if inst_str in ("null", "none", "platform"):
-            base_filter.append(Question.institution_id.is_(None))
-        else:
-            try:
-                inst_uuid = uuid.UUID(str(inst_id).strip())
-            except ValueError:
-                from ..db.subscription_models import Institution
-                inst_obj = session.query(Institution).filter(func.lower(Institution.name) == inst_str).first()
-                inst_uuid = inst_obj.id if inst_obj else None
-            if inst_uuid:
-                base_filter.append(Question.institution_id == inst_uuid)
-
-    if batch_id_arg and batch_id_arg.strip():
-        try:
-            b_uuid = uuid.UUID(batch_id_arg.strip())
-            base_filter.append(Question.generation_batch_id == b_uuid)
-        except ValueError:
-            pass
-
+    # Build the base SELECT — platform-wide questions only (institution_id IS NULL).
+    base_filter = [Question.institution_id.is_(None)]
     if selected is not None:
         base_filter.append(Question.subject == selected.value)
-    if source and source.strip() and source.strip().lower() not in ("all", "any"):
+    if source and source.strip():
         base_filter.append(Question.source_type == source.strip())
 
     total_stmt = select(func.count(Question.id))
@@ -315,7 +251,7 @@ def list_questions() -> Any:
         "page": page,
         "page_size": page_size,
         "subject": selected.value if selected is not None else None,
-        "counts_by_subject": _counts_by_subject(session, institution_id=inst_id),
+        "counts_by_subject": _counts_by_subject(session),
     }
 
 
@@ -325,8 +261,9 @@ def list_questions() -> Any:
 
 
 @router.route("/questions/<question_id>", methods=["DELETE"])
-def delete_question(question_id: uuid.UUID) -> Any:
+def delete_question(question_id: uuid.UUID)-> Any:    
     _admin = require_admin()
+    from flask import g
     db = getattr(g, "db", None)
     session = db
     """Delete a single question, reporting DB-level success or failure.
@@ -378,6 +315,7 @@ def delete_question(question_id: uuid.UUID) -> Any:
 def clear_questions() -> Any:
     """Clear all questions or clear questions for a specific subject."""
     _admin = require_admin()
+    from flask import g, request
     db = getattr(g, "db", None)
     session = db
     
